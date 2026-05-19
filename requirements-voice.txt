@@ -1,0 +1,5 @@
+# Optional voice + speech (install after requirements.txt)
+-r requirements.txt
+pyttsx3>=2.90
+SpeechRecognition>=3.10.0
+sounddevice>=0.4.6

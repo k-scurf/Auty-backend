@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE / OS
+.idea/
+.vscode/
+.cursor/
+.DS_Store
+Thumbs.db
+
+# Local runtime data (biometric — never commit)
+data/
+face_db.pkl
+profiles.json
+memory.json
+logs.txt
+captures/
+*.pkl
+
+# User settings (use config/settings.example.json)
+settings.json
+profiles/
+captures/
+
+# Legacy
+/database/
+
+# Logs
+*.log
+
+# Optional model caches
+.weights/
+.keras/
