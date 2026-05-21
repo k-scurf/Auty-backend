@@ -1,1 +1,1 @@
-"""Tkinter UI theme and widget helpers."""
+"""Tkinter UI theme, shell layout, and widget helpers."""

@@ -21,7 +21,7 @@ EMOTION_LABELS = {
 class UserEmotionAnalyzer:
     def __init__(self, settings: dict):
         self.settings = settings
-        self.enabled = bool(settings.get("user_emotion_enabled", True))
+        self.enabled = bool(settings.get("user_emotion_enabled", False))
         self.interval = int(settings.get("emotion_interval_frames", 24))
         self.interval_locked = int(
             settings.get("emotion_interval_when_locked", 60)

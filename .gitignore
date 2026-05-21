@@ -39,6 +39,10 @@ captures/
 # Legacy
 /database/
 
+# Frontend
+frontend/node_modules/
+frontend/dist/
+
 # Logs
 *.log
 

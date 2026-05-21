@@ -9,22 +9,10 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-THEME_KNOWN = {
-    "border": (0, 255, 220, 255),
-    "glow": (0, 180, 160, 70),
-    "accent": (100, 255, 235, 255),
-    "muted": (160, 190, 200, 255),
-    "bar": (0, 220, 180, 255),
-    "label": (120, 150, 165, 255),
-}
-THEME_UNKNOWN = {
-    "border": (255, 110, 50, 255),
-    "glow": (255, 70, 20, 70),
-    "accent": (255, 170, 100, 255),
-    "muted": (200, 170, 150, 255),
-    "bar": (255, 100, 50, 255),
-    "label": (180, 140, 120, 255),
-}
+from ui.theme import HUD_KNOWN, HUD_UNKNOWN
+
+THEME_KNOWN = HUD_KNOWN
+THEME_UNKNOWN = HUD_UNKNOWN
 
 
 def resolve_status(name, profiles):
@@ -176,14 +164,17 @@ class HUDRenderer:
         x1, y1 = cx, cy
         x2, y2 = cx + card_w, cy + card_h
 
-        for expand in (5, 2):
+        for expand in (4, 1):
             draw.rounded_rectangle(
                 (x1 - expand, y1 - expand, x2 + expand, y2 + expand),
                 radius=radius + expand,
-                fill=(*theme["glow"][:3], int(theme["glow"][3] * fade)),
+                fill=(*theme["glow"][:3], int(theme["glow"][3] * fade * 0.85)),
             )
 
-        draw.rounded_rectangle((x1, y1, x2, y2), radius=radius, fill=(14, 20, 30, int(200 * fade)))
+        fill = theme.get("fill", (18, 24, 32, 215))
+        draw.rounded_rectangle(
+            (x1, y1, x2, y2), radius=radius, fill=(*fill[:3], int(fill[3] * fade))
+        )
         draw.rounded_rectangle(
             (x1, y1, x2, y2),
             radius=radius,
@@ -218,10 +209,11 @@ class HUDRenderer:
         self._draw_row(draw, x1 + pad, row_y, "Age", age, fonts, theme, fade, label_w=label_w)
         row_y += int(22 * scale)
         self._draw_row(draw, x1 + pad, row_y, "Status", status, fonts, theme, fade, label_w=label_w)
-        row_y += int(22 * scale)
-        self._draw_row(
-            draw, x1 + pad, row_y, "Feeling", user_feeling, fonts, theme, fade, label_w=label_w
-        )
+        if self._cfg("user_emotion_enabled", False):
+            row_y += int(22 * scale)
+            self._draw_row(
+                draw, x1 + pad, row_y, "Feeling", user_feeling, fonts, theme, fade, label_w=label_w
+            )
 
         if memory_line:
             row_y += int(20 * scale)
@@ -235,7 +227,7 @@ class HUDRenderer:
         bar_h = max(5, int(6 * scale))
         bar_y = y2 - pad - bar_h
         bar_x1, bar_x2 = x1 + pad, x2 - pad
-        draw.rectangle((bar_x1, bar_y, bar_x2, bar_y + bar_h), fill=(35, 45, 55, int(200 * fade)))
+        draw.rectangle((bar_x1, bar_y, bar_x2, bar_y + bar_h), fill=(30, 38, 48, int(200 * fade)))
         fill_w = int((bar_x2 - bar_x1) * (conf_pct / 100.0) * pulse)
         if fill_w > 0:
             draw.rectangle(
@@ -305,6 +297,12 @@ class HUDRenderer:
             if primary_only and primary_track_id is not None:
                 if track["id"] != primary_track_id:
                     continue
+            if track.get("missing_frames", 0) > 0:
+                continue
+            if bool(self._cfg("track_require_verified_det", True)) and not track.get(
+                "det_verified", False
+            ):
+                continue
             bbox = track.get("smooth_bbox") or track.get("bbox")
             if not bbox:
                 continue

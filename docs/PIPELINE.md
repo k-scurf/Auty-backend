@@ -21,9 +21,11 @@ flowchart TD
 
 ## Perception
 
-1. **Detection** — Haar cascade + validation (`face_detection.detect_faces`).
-2. **Tracking** — IoU/centroid association, KCF/CSRT per track, duplicate identity pruning.
-3. **Recognition** — ArcFace embedding, temporal vote, identity lock (`recognition.py`).
+1. **Detection** — InsightFace RetinaFace (`vision/detector.py`); Haar fallback.
+2. **Tracking** — ByteTrack via boxmot (default) or OpenCV KCF/CSRT.
+3. **Recognition** — InsightFace ArcFace, quality gates, temporal vote + lock confirm (`vision/temporal.py`).
+
+See **`docs/PIPELINE_V2.md`** for tuning and Mac ONNX notes.
 4. **Emotion** — DeepFace emotion model, throttled per track (`user_emotion.py`).
 
 ## Events

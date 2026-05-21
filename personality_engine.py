@@ -63,8 +63,11 @@ SEARCHING_LINES = [
 class PersonalityEngine:
     def __init__(self, settings: dict):
         self.settings = settings
+        self.enabled = bool(settings.get("personality_enabled", False))
 
     def compose_greeting(self, name: str, tier: str, mood: Mood, memory_line: str = "") -> str:
+        if not self.enabled:
+            return ""
         pool = GREETINGS.get(tier, GREETINGS["UNKNOWN"])
         if self.settings.get("sarcasm_mode"):
             pool = GREETINGS_SARCASM.get(tier, pool)
@@ -77,6 +80,8 @@ class PersonalityEngine:
         return line
 
     def compose_status(self, state: str, mood: Mood) -> str:
+        if not self.enabled:
+            return state
         if state in ("IDLE", "Idle"):
             return random.choice(IDLE_LINES)
         if state in ("DETECTING", "Searching"):

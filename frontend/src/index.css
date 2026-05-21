@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: #0b0f14;
+  font-family: Inter, system-ui, sans-serif;
+}
+
+@layer components {
+  .glass-card {
+    @apply rounded-xl border border-border/80 bg-card/90 backdrop-blur-sm shadow-glow;
+  }
+}

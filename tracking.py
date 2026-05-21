@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 import face_detection
+from vision.tracker_bytetrack import ByteTrackAdapter
 
 
 class TrackState(str, Enum):
@@ -117,10 +118,19 @@ class FaceTrackManager:
         self.new_track_fn = new_track_fn
         self.tracks = {}
         self.next_track_id = 0
+        self._byte = ByteTrackAdapter()
+        self._byte_id_map: dict = {}
 
     def reset(self):
         self.tracks.clear()
         self.next_track_id = 0
+        self._byte_id_map.clear()
+
+    @staticmethod
+    def _det_bbox(det):
+        if isinstance(det, dict):
+            return det["bbox"]
+        return det
 
     def _cfg(self, key, default):
         return self.settings.get(key, default)
@@ -161,6 +171,50 @@ class FaceTrackManager:
         dist = centroid_distance(det_bbox, track_bbox)
         return iou >= iou_thresh or dist < max_dist
 
+    def _apply_det_meta(self, track, det):
+        if isinstance(det, dict):
+            if det.get("kps") is not None:
+                track["kps"] = det["kps"]
+            track["pose_yaw"] = float(det.get("pose_yaw", 0.0))
+            if "score" in det:
+                track["last_det_score"] = float(det["score"])
+        else:
+            kps = getattr(det, "kps", None)
+            if kps is not None:
+                track["kps"] = kps
+            track["pose_yaw"] = float(getattr(det, "pose_yaw", 0.0))
+            track["last_det_score"] = float(getattr(det, "score", 0.9))
+
+    def _age_stale_tracks(self, verified_ids: set, *, run_detect: bool):
+        """Drop ghost boxes fast; verified tracks tolerate detect gaps."""
+        max_missing = int(self._cfg("max_missing_frames", 5))
+        max_unverified = int(self._cfg("max_unverified_frames", 2))
+        to_remove = []
+
+        for tid, track in list(self.tracks.items()):
+            if tid in verified_ids:
+                track["missing_frames"] = 0
+                continue
+
+            if not track.get("det_verified", False):
+                track["missing_frames"] = track.get("missing_frames", 0) + 1
+                if track["missing_frames"] >= max_unverified:
+                    track["state"] = TrackState.REMOVED
+                    to_remove.append(tid)
+                continue
+
+            if run_detect:
+                track["missing_frames"] = track.get("missing_frames", 0) + 1
+                if track["missing_frames"] > max_missing:
+                    track["state"] = TrackState.REMOVED
+                    to_remove.append(tid)
+
+        for tid in to_remove:
+            del self.tracks[tid]
+            for bt_id, aid in list(self._byte_id_map.items()):
+                if aid == tid:
+                    del self._byte_id_map[bt_id]
+
     def _associate_detections(self, frame, detections):
         alpha = float(self._cfg("bbox_smooth_alpha", 0.3))
         reinit_iou = float(self._cfg("tracker_reinit_iou", 0.15))
@@ -173,14 +227,15 @@ class FaceTrackManager:
 
         pairs = []
         for di, det in enumerate(detections):
+            dbbox = self._det_bbox(det)
             for track in active:
                 ref = track.get("smooth_bbox") or track.get("bbox")
                 if ref is None:
                     continue
-                if not self._detection_matches_track(det, ref):
+                if not self._detection_matches_track(dbbox, ref):
                     continue
-                iou = bbox_iou(det, ref)
-                dist = centroid_distance(det, ref)
+                iou = bbox_iou(dbbox, ref)
+                dist = centroid_distance(dbbox, ref)
                 pairs.append((iou, -dist, di, track["id"]))
 
         pairs.sort(key=lambda p: (p[0], p[1]), reverse=True)
@@ -192,6 +247,7 @@ class FaceTrackManager:
             if di in matched_dets or tid in matched_tids:
                 continue
             det = detections[di]
+            dbbox = self._det_bbox(det)
             track = self.tracks[tid]
             matched_dets.add(di)
             matched_tids.add(tid)
@@ -199,18 +255,20 @@ class FaceTrackManager:
             track["missing_frames"] = 0
             track["last_seen"] = time.time()
             track["state"] = TrackState.ACTIVE
+            self._apply_det_meta(track, det)
 
-            ref = track.get("smooth_bbox") or track.get("bbox") or det
-            if bbox_iou(det, ref) < reinit_iou:
-                self._init_opencv_tracker(track, frame, det)
-            apply_smooth_bbox(track, det, alpha)
+            ref = track.get("smooth_bbox") or track.get("bbox") or dbbox
+            if bbox_iou(dbbox, ref) < reinit_iou:
+                self._init_opencv_tracker(track, frame, dbbox)
+            apply_smooth_bbox(track, dbbox, alpha)
 
         for di, det in enumerate(detections):
             if di in matched_dets:
                 continue
-            if self._is_duplicate_detection(det):
+            dbbox = self._det_bbox(det)
+            if self._is_duplicate_detection(dbbox):
                 if self._cfg("debug_scores", False):
-                    print(f"[tracking] skip duplicate detection {det}")
+                    print(f"[tracking] skip duplicate detection {dbbox}")
                 continue
 
             tid = self.next_track_id
@@ -219,10 +277,11 @@ class FaceTrackManager:
             track["state"] = TrackState.ACTIVE
             track["missing_frames"] = 0
             track["last_seen"] = time.time()
-            track["smooth_bbox"] = det
-            track["bbox"] = det
+            track["smooth_bbox"] = dbbox
+            track["bbox"] = dbbox
             track["velocity"] = (0.0, 0.0)
-            self._init_opencv_tracker(track, frame, det)
+            self._apply_det_meta(track, det)
+            self._init_opencv_tracker(track, frame, dbbox)
             self.tracks[tid] = track
 
         for track in active:
@@ -319,7 +378,76 @@ class FaceTrackManager:
         for tid in to_remove:
             del self.tracks[tid]
 
+    def _step_bytetrack(self, frame, frame_count: int):
+        detect_interval = int(self._cfg("detect_interval_frames", 15))
+        alpha = float(self._cfg("bbox_smooth_alpha", 0.3))
+        min_iou = float(self._cfg("tracker_min_det_iou", 0.25))
+        require_verified = bool(self._cfg("track_require_verified_det", True))
+
+        run_detect = (frame_count % detect_interval == 0) or not self.tracks
+        verified_ids: set = set()
+
+        if run_detect:
+            detections = self._run_detection(frame)
+            xyxy = []
+            det_by_idx = []
+            for det in detections:
+                x, y, w, h = self._det_bbox(det)
+                score = float(det.get("score", 0.9)) if isinstance(det, dict) else 0.9
+                xyxy.append((x, y, x + w, y + h, score))
+                det_by_idx.append(det)
+
+            bt_out = self._byte.update(frame, xyxy) if xyxy else {}
+
+            for bt_id, bbox in bt_out.items():
+                best_iou = 0.0
+                best_det = None
+                for det in det_by_idx:
+                    dbbox = self._det_bbox(det)
+                    iou = bbox_iou(dbbox, bbox)
+                    if iou > best_iou:
+                        best_iou = iou
+                        best_det = det
+
+                if require_verified and (
+                    best_det is None or best_iou < min_iou
+                ):
+                    continue
+
+                auty_id = self._byte_id_map.get(bt_id)
+                if auty_id is None or auty_id not in self.tracks:
+                    auty_id = self.next_track_id
+                    self.next_track_id += 1
+                    track = self.new_track_fn(auty_id)
+                    track["det_verified"] = False
+                    self.tracks[auty_id] = track
+                    self._byte_id_map[bt_id] = auty_id
+                else:
+                    track = self.tracks[auty_id]
+
+                track["state"] = TrackState.ACTIVE
+                track["missing_frames"] = 0
+                track["last_seen"] = time.time()
+                apply_smooth_bbox(track, bbox, alpha)
+                self._apply_det_meta(track, best_det)
+                track["det_verified"] = True
+                track["stable_count"] = min(
+                    track.get("stable_count", 0) + 1, 64
+                )
+                verified_ids.add(auty_id)
+
+            self._age_stale_tracks(verified_ids, run_detect=True)
+        else:
+            self._age_stale_tracks(verified_ids, run_detect=False)
+
+        self.prune_duplicate_identity_tracks()
+
     def step(self, frame, frame_count: int):
+        backend = str(self._cfg("tracker_backend", "bytetrack")).lower()
+        if backend == "bytetrack":
+            self._step_bytetrack(frame, frame_count)
+            return
+
         detect_interval = int(self._cfg("detect_interval_frames", 10))
         run_detect = (frame_count % detect_interval == 0) or not self.tracks
 

@@ -2,22 +2,22 @@
 
 Auty splits persistence into three stores under `data/` (gitignored).
 
-## `face_db.pkl`
+## Identity v2 (`data/identities/`)
 
-Python pickle dict:
+Each person has a UUID folder:
 
 ```text
-{
-  "Alice": [ embedding_vector, ... ],
-  "Bob": [ ... ],
-}
+data/identities/{uuid}/
+  meta.json          # name, enrolled_at, poses, profile metadata
+  embeddings.npy     # all sample embeddings
+  images/*.jpg       # enrollment crops
 ```
 
-- Each value is a list of L2-normalized ArcFace embeddings (numpy arrays).
-- Matching uses **best cosine score** across all samples per person.
-- Capped by `max_embeddings_per_person` in settings.
+- **Master embedding** — mean of samples, L2-normalized, used for fast matching.
+- Legacy `face_db.pkl` is migrated on first load via `scripts/migrate_identity_v2.py`.
+- A pickle mirror of name → embeddings is still written for compatibility.
 
-Managed by `database.FaceDatabase` (`FaceDatabase` class).
+Managed by `vision.identity_store.IdentityStore` (facade: `database.FaceDatabase`).
 
 ## `profiles.json`
 

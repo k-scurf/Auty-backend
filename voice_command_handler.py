@@ -49,10 +49,13 @@ def handle_intent(
 
     if intent == "greet":
         if name != "UNKNOWN":
-            line = brain.personality.compose_greeting(
-                name, tier, mood, brain.memory.get_memory_line(name)
-            )
-            say(line)
+            if brain.personality_enabled:
+                line = brain.personality.compose_greeting(
+                    name, tier, mood, brain.memory.get_memory_line(name)
+                )
+                say(line or f"Hello, {name}.")
+            else:
+                say(f"Hello, {name}.")
         else:
             say("Hello. Step into view so I can see you.")
         return

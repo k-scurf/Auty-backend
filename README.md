@@ -1,6 +1,6 @@
 # Auty — Friendly Vision
 
-Real-time facial recognition desktop app with multi-face tracking, ArcFace identity matching, a futuristic HUD, and an event-driven personality layer (greetings, memory, optional voice and local LLM via Ollama).
+Real-time facial recognition with multi-face tracking, ArcFace identity matching, a live MJPEG feed, and a React dashboard. The Python backend runs the vision pipeline; the browser UI shows live video, profiles, logs, and alerts.
 
 **License:** [Apache-2.0](LICENSE) · SPDX-License-Identifier: Apache-2.0
 
@@ -21,7 +21,10 @@ Real-time facial recognition desktop app with multi-face tracking, ArcFace ident
 | Vision | OpenCV, Haar + KCF/CSRT tracking |
 | Identity | DeepFace (ArcFace embeddings) |
 | Alignment | MediaPipe Face Mesh (optional fallback crop) |
-| UI | Tkinter, Pillow |
+| API | FastAPI, uvicorn, WebSocket |
+| UI | React, Vite, Tailwind CSS, Framer Motion |
+| Stream | MJPEG + WebSocket track metadata |
+| HUD (optional) | Pillow overlays on server stream |
 | AI behavior | Custom event system, state machine, response engine |
 | Voice (optional) | pyttsx3, SpeechRecognition, sounddevice |
 | LLM (optional) | Ollama HTTP API (localhost) |
@@ -52,10 +55,25 @@ pip install -r requirements-voice.txt
 
 ## First run
 
+**Terminal 1 — API (port 8000):**
+
 ```bash
 cp config/settings.example.json data/settings.json
+pip install -r requirements.txt
 python3 main.py
 ```
+
+**Terminal 2 — React dashboard (port 5173):**
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Open [http://localhost:5173](http://localhost:5173). Vite proxies `/api` to the Python server.
+
+**Production (single port):** `cd frontend && npm run build`, then start `python3 main.py` — FastAPI serves `frontend/dist` when present.
 
 On first launch, any existing `face_db.pkl` / `profiles.json` at the repo root are **copied** into `data/` (originals left in place).
 
@@ -68,22 +86,23 @@ Environment overrides:
 
 - **Recognized users** — appear with a green HUD card; Auty may greet once per session (cooldown configurable).
 - **Unknown face** — enrollment panel opens; save a profile or skip.
-- **Side panel** — shows AI state, mood, detected emotion, last spoken line.
+- **Dashboard** — live feed, primary profile card, FSM state and mood.
+- **Logs / Alerts / Profiles / Settings** — session timeline, unknown alerts, enrolled people, toggles.
 - **Build DB offline** — place photos in `scripts/profile_sources/`, then `python3 scripts/build_db.py`.
 
 ## Project structure
 
 ```
 Auty/
-├── main.py                 # Application entry
+├── main.py                 # Starts FastAPI on :8000
+├── server/                 # VisionEngine + REST + MJPEG + WebSocket
+├── frontend/               # Vite React dashboard
 ├── config/                 # settings.example.json (committed)
 ├── data/                   # Local DB, profiles, captures (gitignored)
+├── legacy/tk/             # Archived Tkinter UI (reference)
 ├── docs/                   # Architecture, setup, pipeline
 ├── scripts/                # build_db.py, legacy experiments
-├── assets/screenshots/     # README images
-├── ui/                     # Theme + widget helpers
-├── utils/                  # Paths, performance helpers
-└── *.py                    # Core modules (perception, AI core, voice)
+└── *.py                    # Core vision modules (unchanged)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the event pipeline.

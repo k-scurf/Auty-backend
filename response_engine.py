@@ -97,7 +97,9 @@ class ResponseEngine:
         self.bus = event_bus
         self.fsm = state_machine
         self.memory = memory
-        self.enabled = bool(settings.get("personality_enabled", True))
+        self.personality_enabled = bool(settings.get("personality_enabled", False))
+        self.greetings_enabled = bool(settings.get("greetings_enabled", False))
+        self.greeting_bar_enabled = bool(settings.get("greeting_bar_enabled", False))
         self.personality = PersonalityEngine(settings)
         self.voice = VoiceSystem(settings)
         self.llm_handler = LlmResponseHandler(settings)
@@ -121,8 +123,7 @@ class ResponseEngine:
         self._ollama_ok = False
         self._ui_callbacks: List = []
 
-        if self.enabled:
-            self.bus.subscribe_all(self._on_event)
+        self.bus.subscribe_all(self._on_event)
 
     def register_ui_callback(self, callback):
         """callback(ctx: ResponseContext) — refresh Tk labels."""
@@ -161,16 +162,22 @@ class ResponseEngine:
 
     def process_frame(self, frame, primary_track: Optional[dict]):
         """Apply effects and build per-track HUD context after events processed."""
-        if not self.enabled:
-            return frame, self._ctx
-
         self.sequences.tick()
         self._rebuild_track_context(primary_track)
-        tone = self.rules.profile_for_state(self._ctx.state, familiar=self._ctx.familiar)
-        self._ctx.ui_motion = tone.ui_motion.value
-        self._ctx.status_line = self.rules.compose_status_line(
-            self._ctx.state, self._ctx.mood, familiar=self._ctx.familiar
-        )
+        if self.personality_enabled:
+            tone = self.rules.profile_for_state(self._ctx.state, familiar=self._ctx.familiar)
+            self._ctx.ui_motion = tone.ui_motion.value
+            self._ctx.status_line = self.rules.compose_status_line(
+                self._ctx.state, self._ctx.mood, familiar=self._ctx.familiar
+            )
+        else:
+            self._ctx.ui_motion = "minimal"
+            self._ctx.status_line = self._ctx.state
+            self._ctx.greeting_bar = ""
+
+        if not self.greeting_bar_enabled:
+            self._ctx.greeting_bar = ""
+            self._async_greeting_bar = ""
 
         bbox = None
         tid = None
@@ -181,7 +188,7 @@ class ResponseEngine:
         self._ctx.active_tid = tid
         self._ctx.active_bbox = bbox
 
-        if self._async_greeting_bar:
+        if self.greeting_bar_enabled and self._async_greeting_bar:
             self._ctx.greeting_bar = self._async_greeting_bar
 
         frame = self.effects.draw(
@@ -224,7 +231,11 @@ class ResponseEngine:
             tmood = mood_for_identity(tname, ttier, True, state_enum)
             themes[tid] = theme_for_mood(tmood, known=tname != "UNKNOWN")
             mem_lines[tid] = self.memory.get_visit_summary(tname) if tstable else ""
-            feelings[tid] = self._feeling_label(t)
+            feelings[tid] = (
+                self._feeling_label(t)
+                if self.settings.get("user_emotion_enabled", False)
+                else "—"
+            )
 
         self._ctx.track_themes = themes
         self._ctx.memory_lines = mem_lines
@@ -248,6 +259,9 @@ class ResponseEngine:
     def _handle_face_recognized(self, event: FaceRecognized):
         # Only the attention primary target drives greetings and sequences.
         if self._primary_tid is not None and event.track_id != self._primary_tid:
+            return
+
+        if not self.greetings_enabled:
             return
 
         name = event.name
@@ -332,6 +346,8 @@ class ResponseEngine:
         self._notify_ui()
 
     def _seq_greet(self, flow: RecognizedFlowContext):
+        if not self.personality_enabled:
+            return
         tone = self.rules.profile_for_state(self.fsm.state.value, familiar=flow.familiar)
         if not tone.speak_enabled or not self.settings.get("voice_enabled", False):
             line = self.personality.compose_greeting(

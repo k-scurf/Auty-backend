@@ -10,6 +10,11 @@ class CameraStream:
         self.cap = cv2.VideoCapture(int(settings["camera_index"]))
         self.process_width = process_width
         self.process_height = process_height
+        # Drop stale buffered frames so the feed stays live (reduces lag).
+        try:
+            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
 
     def read(self):
         """Returns (ok, bgr_frame) at process resolution, mirrored."""
@@ -25,4 +30,6 @@ class CameraStream:
         return True, frame
 
     def release(self):
-        self.cap.release()
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None

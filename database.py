@@ -1,5 +1,5 @@
 """
-Face embedding database (pickle) and profile metadata (JSON).
+Face database — IdentityStore v2 with legacy pickle migration.
 """
 
 import json
@@ -8,6 +8,7 @@ import pickle
 
 import recognition as rec
 from utils.paths import CAPTURES_DIR, FACE_DB_PATH, PROFILES_PATH, ensure_directories
+from vision.identity_store import IdentityStore
 
 ensure_directories()
 FACE_DB = str(FACE_DB_PATH)
@@ -18,6 +19,7 @@ CAPTURE_FOLDER = str(CAPTURES_DIR)
 class FaceDatabase:
     def __init__(self, settings: dict):
         self.settings = settings
+        self.store = IdentityStore(settings)
         self.face_db = {}
         self.max_embeddings = int(settings.get("max_embeddings_per_person", 25))
         self._profiles_cache = None
@@ -46,42 +48,68 @@ class FaceDatabase:
                     normalized[str(name)] = samples[: self.max_embeddings]
         return normalized
 
-    def load(self):
+    def _migrate_pickle_if_needed(self):
+        if self.face_db:
+            return
         if not os.path.exists(FACE_DB):
-            self.face_db = {}
-            return self.face_db
-        with open(FACE_DB, "rb") as f:
-            self.face_db = self.normalize_face_db(pickle.load(f))
+            return
+        try:
+            with open(FACE_DB, "rb") as f:
+                raw = pickle.load(f)
+            legacy = self.normalize_face_db(raw)
+            profiles = self.load_profiles()
+            for name, embeddings in legacy.items():
+                prof = profiles.get(name, {})
+                image = prof.get("image")
+                self.store.add_person(
+                    name,
+                    embeddings,
+                    image_path=image,
+                    profile=prof,
+                )
+            self.face_db = self.store.build_face_db()
+            print(f"[database] Migrated {len(legacy)} profile(s) to identity v2")
+        except (OSError, pickle.UnpicklingError, EOFError, ValueError) as exc:
+            print(f"[database] Pickle migration skipped: {exc}")
+
+    def load(self):
+        self.face_db = self.store.load()
+        self._migrate_pickle_if_needed()
+        if not self.face_db:
+            self.face_db = self.store.build_face_db()
         return self.face_db
 
     def save(self):
+        self.face_db = self.store.build_face_db()
         with open(FACE_DB, "wb") as f:
             pickle.dump(self.face_db, f)
 
-    def reset(self):
+    def reset(self, *, clear_captures: bool = True):
+        self.store.reset(clear_captures=clear_captures)
         self.face_db = {}
-        self.save()
+        with open(FACE_DB, "wb") as f:
+            pickle.dump({}, f)
         with open(PROFILE_DB, "w") as f:
             json.dump({}, f)
         self._profiles_cache = {}
         self._profiles_mtime = os.path.getmtime(PROFILE_DB)
+        if clear_captures and os.path.isdir(CAPTURE_FOLDER):
+            for fname in os.listdir(CAPTURE_FOLDER):
+                if fname.lower().endswith((".jpg", ".jpeg", ".png")):
+                    try:
+                        os.remove(os.path.join(CAPTURE_FOLDER, fname))
+                    except OSError:
+                        pass
 
     def add_embedding(self, name, embedding):
         if not name or not rec.is_embedding(embedding):
             return False
-        samples = self.face_db.setdefault(name, [])
-        samples.append(rec.l2_normalize(embedding))
-        if len(samples) > self.max_embeddings:
-            del samples[: len(samples) - self.max_embeddings]
+        self.store.add_embedding(name, embedding)
+        self.face_db = self.store.build_face_db()
         return True
 
     def embedding_is_new(self, name, embedding):
-        samples = self.face_db.get(name, [])
-        if not samples:
-            return True
-        best = max(rec.cosine_similarity(embedding, s) for s in samples)
-        min_dist = float(self.settings.get("min_new_embedding_distance", 0.02))
-        return (1.0 - best) >= min_dist
+        return self.store.embedding_is_new(name, embedding)
 
     def load_profiles(self):
         if not os.path.exists(PROFILE_DB):
@@ -98,6 +126,62 @@ class FaceDatabase:
     def get_profile(self, name):
         return self.load_profiles().get(name)
 
+    def get_profile_by_id(self, rec_id: str):
+        for rec in self.store._records.values():
+            if rec.id == rec_id:
+                meta = rec.metadata or {}
+                return {
+                    "id": rec.id,
+                    "name": rec.name,
+                    "age": meta.get("age", ""),
+                    "status": meta.get("status", ""),
+                    "image": rec.image_paths[0] if rec.image_paths else None,
+                    "enrolled_at": rec.enrolled_at,
+                }
+        return None
+
+    def delete_profile(self, name: str = None, rec_id: str = None) -> bool:
+        if rec_id:
+            rec = self.store._records.get(rec_id)
+            if rec:
+                name = rec.name
+            self.store.delete(rec_id)
+        elif name:
+            rec = self.store.find_by_name(name)
+            if rec:
+                self.store.delete(rec.id)
+        else:
+            return False
+        data = self.load_profiles()
+        if name and name in data:
+            del data[name]
+            with open(PROFILE_DB, "w") as f:
+                json.dump(data, f, indent=4)
+            self._profiles_cache = data
+        self.face_db = self.store.build_face_db()
+        self.save()
+        return True
+
+    def rename_profile(self, old_name: str, new_name: str) -> bool:
+        old_name = old_name.strip()
+        new_name = new_name.strip()
+        if not old_name or not new_name or old_name.lower() == new_name.lower():
+            return False
+        rec = self.store.rename_person(old_name, new_name)
+        if rec is None:
+            return False
+        data = self.load_profiles()
+        prof = data.pop(old_name, None) or self.get_profile(old_name) or {}
+        prof["name"] = new_name
+        data[new_name] = prof
+        with open(PROFILE_DB, "w") as f:
+            json.dump(data, f, indent=4)
+        self._profiles_cache = data
+        self._profiles_mtime = os.path.getmtime(PROFILE_DB)
+        self.face_db = self.store.build_face_db()
+        self.save()
+        return True
+
     def save_profile(self, name, profile):
         data = self.load_profiles()
         data[name] = profile
@@ -105,7 +189,7 @@ class FaceDatabase:
             json.dump(data, f, indent=4)
         self._profiles_cache = data
         self._profiles_mtime = os.path.getmtime(PROFILE_DB)
-
-    @property
-    def capture_folder(self):
-        return CAPTURE_FOLDER
+        rec_meta = self.store.find_by_name(name)
+        if rec_meta:
+            rec_meta.metadata = profile
+            self.store.save_record(rec_meta)

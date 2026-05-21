@@ -40,6 +40,17 @@ class MemoryManager:
         except (json.JSONDecodeError, OSError):
             return {}
 
+    def reset(self):
+        """Clear visit history and relationship data (fresh session)."""
+        self.data = {}
+        self._dirty = False
+        self._last_save = time.time()
+        parent = os.path.dirname(self.path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(self.path, "w") as f:
+            json.dump({}, f, indent=2)
+
     def save(self, *, force: bool = False):
         now = time.time()
         if not force and not self._dirty:
@@ -114,11 +125,23 @@ class MemoryManager:
             )
 
         hist = entry.setdefault("history", [])
+        # Avoid duplicate back-to-back identical log lines (same second, same event).
+        if hist:
+            last = hist[-1]
+            if (
+                last.get("event") == event
+                and (now - float(last.get("ts", 0))) < 2.0
+            ):
+                entry["last_seen"] = now
+                self._mark_dirty()
+                return
+
         hist.append({"ts": now, "event": event, "mood": mood})
         if len(hist) > self.history_limit:
             entry["history"] = hist[-self.history_limit :]
         self._mark_dirty()
-        self.save()
+        if (now - self._last_save) >= self._save_delay:
+            self.save()
 
     def get_relationship_tier(self, name: str, profiles: dict) -> str:
         if name == "UNKNOWN":

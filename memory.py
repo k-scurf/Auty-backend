@@ -65,6 +65,10 @@ class Memory:
     def get_memory_line(self, name: str) -> str:
         return self.get_visit_summary(name)
 
+    def reset(self):
+        """Clear social memory file and in-memory visit history."""
+        self.social.reset()
+
     def save(self, *, force: bool = False):
         if force:
             self._persist()
