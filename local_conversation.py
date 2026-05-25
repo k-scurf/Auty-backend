@@ -33,7 +33,6 @@ class LocalConversation:
         name: str,
         mood: str,
         memory_snippet: str = "",
-        user_emotion: str = "",
     ) -> str:
         if not self.enabled:
             return ""
@@ -48,11 +47,8 @@ class LocalConversation:
             "You are Auty, a friendly face-recognition assistant on a computer screen. "
             "Keep replies to one short spoken sentence. No markdown."
         )
-        feeling_bit = ""
-        if user_emotion and user_emotion != "—":
-            feeling_bit = f"They appear {user_emotion}. "
         prompt = (
-            f"Person: {name}. Auty mood: {mood}. {feeling_bit}"
+            f"Person: {name}. Auty mood: {mood}. "
             f"{memory_snippet} "
             f"Context: {user_context}. "
             "Say something brief and natural."

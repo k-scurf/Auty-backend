@@ -1,11 +1,20 @@
 import { motion } from "framer-motion";
 
+const STATE_LABELS: Record<string, string> = {
+  IDLE: "Ready",
+  DETECTING: "Scanning",
+  RECOGNIZED: "Employee Recognized",
+  UNKNOWN: "Unrecognized Face",
+  ALERT: "Attention Required",
+  ENGAGED: "Active",
+};
+
 interface Props {
   fsmState: string;
-  mood: string;
 }
 
-export function StatusPills({ fsmState, mood }: Props) {
+export function StatusPills({ fsmState }: Props) {
+  const label = STATE_LABELS[fsmState] ?? fsmState;
   return (
     <div className="flex flex-wrap gap-2">
       <motion.span
@@ -14,11 +23,8 @@ export function StatusPills({ fsmState, mood }: Props) {
         animate={{ opacity: 1, y: 0 }}
         className="rounded-full border border-border bg-inset px-3 py-1 text-xs font-medium text-slate-300"
       >
-        {fsmState}
+        {label}
       </motion.span>
-      <span className="rounded-full border border-accent/30 bg-accent/10 px-3 py-1 text-xs font-medium text-accent">
-        {mood}
-      </span>
     </div>
   );
 }

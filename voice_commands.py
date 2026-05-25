@@ -10,7 +10,6 @@ from typing import Callable, Optional
 # (intent, patterns) — matched case-insensitively on normalized text
 COMMAND_PATTERNS = [
     ("whoami", r"\b(who am i|what'?s my name|what do you call me|identify me|recognize me)\b"),
-    ("feeling", r"\b(how am i feeling|what'?s my mood|my emotion|how do i look|what emotion)\b"),
     ("greet", r"\b(hello|hi auty|hey auty|greet me|say hello|good (morning|afternoon|evening))\b"),
     ("repeat", r"\b(repeat|say that again|what did you say|say again)\b"),
     ("status", r"\b(status|what are you doing|what'?s your state|how are you)\b"),
@@ -37,8 +36,6 @@ def parse_command(text: str) -> Optional[str]:
     # Short fuzzy fallbacks
     if "name" in norm and ("what" in norm or "who" in norm):
         return "whoami"
-    if "feel" in norm or "emotion" in norm or "mood" in norm:
-        return "feeling"
     return None
 
 

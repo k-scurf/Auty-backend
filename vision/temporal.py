@@ -11,7 +11,6 @@ from vision.config import get_cfg
 from vision.matcher import (
     MatchResult,
     match_identity_detailed,
-    sync_gallery,
 )
 
 
@@ -181,9 +180,6 @@ def update_locked_identity(track: dict, candidate_name: str, candidate_score: fl
 
 
 def apply_embedding_to_track(face_db: dict, track: dict, embedding):
-    if face_db:
-        sync_gallery(face_db)
-
     if embedding is None:
         update_locked_identity(track, "UNKNOWN", -1.0)
         track["last_distance"] = None
@@ -210,6 +206,13 @@ def apply_embedding_to_track(face_db: dict, track: dict, embedding):
     track["last_match_margin"] = result.margin
     track["last_reject_reason"] = result.reject_reason
     track["last_best_name"] = result.name
+
+    if get_cfg("debug_scores", False):
+        print(
+            f"[recog] T{track.get('id')} best={result.name!r} score={result.best_score:.3f}"
+            f" accepted={result.accepted} reason={result.reject_reason!r}"
+            f" locked={locked!r}"
+        )
 
     frame_name, frame_score, frame_dist = _resolve_frame_candidate(track, result)
     votes.append((frame_name, frame_score, time.time()))
@@ -240,7 +243,8 @@ def apply_embedding_to_track(face_db: dict, track: dict, embedding):
 def _log(msg: str):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     print(line)
-    path = get_cfg("log_file", "logs.txt")
+    from utils.paths import LOG_PATH
+    path = get_cfg("log_file", str(LOG_PATH))
     try:
         with open(path, "a") as f:
             f.write(line + "\n")

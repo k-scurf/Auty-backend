@@ -31,7 +31,6 @@ from attention_manager import AttentionManager
 from timing_controller import TimingController
 from event_system import (
     AttentionShifted,
-    EmotionUpdated,
     EventBus,
     FaceDetected,
     FaceLost,
@@ -43,7 +42,6 @@ from event_system import (
 from memory import Memory
 from response_engine import ResponseEngine
 from state_machine import AIState, FSMContext, StateMachine
-import user_emotion
 import recognition_worker
 from ui.image_fit import bgr_to_photo_cover, bgr_to_photo_cover_rounded
 from ui.shell import build_shell
@@ -75,7 +73,6 @@ DEFAULT_SETTINGS = {
     "recognition_interval_when_locked": 90,
     "recognition_locked_seconds": 6.0,
     "detect_interval_frames": 15,
-    "emotion_interval_when_locked": 60,
     "max_centroid_dist": 50,
     "iou_match_threshold": 0.25,
     "iou_duplicate_threshold": 0.15,
@@ -140,7 +137,6 @@ DEFAULT_SETTINGS = {
     "memory_file": "memory.json",
     "voice_enabled": False,
     "tts_enabled": False,
-    "user_emotion_enabled": False,
     "greeting_bar_enabled": False,
     "greetings_enabled": False,
     "local_llm_enabled": False,
@@ -155,7 +151,6 @@ DEFAULT_SETTINGS = {
     "voice_language": "en-US",
     "voice_prefer_offline": False,
     "async_recognition": True,
-    "emotion_skip_when_locked": True,
     "recognition_locked_seconds": 10.0,
     "memory_save_delay_seconds": 5.0,
     "event_system_enabled": True,
@@ -209,17 +204,14 @@ fsm.set_timing_controller(timing_controller)
 attention_mgr.set_timing_controller(timing_controller)
 memory = Memory(SETTINGS, db)
 response_engine = ResponseEngine(SETTINGS, event_bus, fsm, memory)
-emotion_analyzer = user_emotion.UserEmotionAnalyzer(SETTINGS)
 rec_worker = recognition_worker.RecognitionWorker()
 EVENT_SYSTEM_ENABLED = bool(SETTINGS.get("event_system_enabled", True))
 VOICE_ENABLED = bool(SETTINGS.get("voice_enabled", False))
-EMOTION_ENABLED = bool(SETTINGS.get("user_emotion_enabled", False))
 _prev_track_ids: set = set()
 _recognized_emitted: set = set()
 _recognized_names_session: set = set()
 _unknown_emitted: set = set()
 _camera_loop_busy = False
-_last_emotion_by_tid: dict = {}
 ASYNC_RECOGNITION = bool(SETTINGS.get("async_recognition", True))
 db.configure()
 
@@ -607,7 +599,7 @@ if VOICE_ENABLED:
     waveform = ui_waveform.WaveformPanel(voice_section, THEME)
 
     voice_heard_var = tk.StringVar(
-        value='Say: "Who am I?" · "How am I feeling?" · "Help"'
+        value='Say: "Who am I?" · "Help"'
     )
     tk.Label(
         voice_section,
@@ -713,7 +705,7 @@ track_manager = None
 
 def reset_session():
     """Clear per-run recognition and enrollment state (each app launch)."""
-    global frame_count, track_manager, _prev_track_ids, _recognized_emitted, _unknown_emitted, _last_emotion_by_tid, _recognized_names_session
+    global frame_count, track_manager, _prev_track_ids, _recognized_emitted, _unknown_emitted, _recognized_names_session
 
     if RESET_DB_EACH_RUN:
         db.reset()
@@ -725,7 +717,6 @@ def reset_session():
     _recognized_emitted = set()
     _recognized_names_session = set()
     _unknown_emitted = set()
-    _last_emotion_by_tid = {}
     fsm.state = AIState.IDLE
     fsm.ctx = FSMContext()
     attention_mgr._current_primary = None
@@ -815,13 +806,6 @@ def _should_run_recognition(track: dict, frame_count: int) -> bool:
     return True
 
 
-def _should_run_emotion(track: dict, frame_count: int) -> bool:
-    if not emotion_analyzer.enabled:
-        return False
-    interval = emotion_analyzer.interval_for_track(track)
-    return frame_count - track.get("last_emotion_frame", -999) >= interval
-
-
 def _queue_event(event):
     event.timestamp = time.time()
     event.frame_count = frame_count
@@ -840,7 +824,6 @@ def _emit_track_lifecycle(active_tids: set):
         _queue_event(FaceLost(track_id=tid))
         _recognized_emitted = {k for k in _recognized_emitted if k[0] != tid}
         _unknown_emitted.discard(tid)
-        _last_emotion_by_tid.pop(tid, None)
     _prev_track_ids = set(active_tids)
 
 
@@ -881,20 +864,6 @@ def _sync_identity_events(tracks):
             )
             _unknown_emitted.add(tid)
             _log_identity_event("unknown", track)
-
-
-def _emit_emotion_if_changed(track: dict):
-    tid = track["id"]
-    emo = track.get("user_emotion")
-    if not emo:
-        return
-    pct = int(track.get("user_emotion_pct", 0))
-    if _last_emotion_by_tid.get(tid) == (emo, pct):
-        return
-    _last_emotion_by_tid[tid] = (emo, pct)
-    _queue_event(
-        EmotionUpdated(track_id=tid, emotion=emo, confidence_pct=pct)
-    )
 
 
 def _process_frame_events():
@@ -952,9 +921,8 @@ def update_camera():
             x, y, w, h = track.get("smooth_bbox") or track.get("bbox", (0, 0, 0, 0))
 
             need_rec = bool(db.face_db) and _should_run_recognition(track, frame_count)
-            need_emo = EMOTION_ENABLED and _should_run_emotion(track, frame_count)
             aligned = None
-            if need_rec or need_emo:
+            if need_rec:
                 aligned = rec.align_face(frame, x, y, w, h)
             elif _track_is_known_stable(track):
                 track["miss_count"] = 0
@@ -983,12 +951,6 @@ def update_camera():
 
             if track.get("locked_name", "UNKNOWN") == "UNKNOWN" and aligned is not None and aligned.size != 0:
                 unknown_faces.append((w * h, tid, aligned.copy()))
-
-            if need_emo and aligned is not None and aligned.size != 0:
-                prev_emo = track.get("user_emotion")
-                emotion_analyzer.maybe_update(track, aligned, frame_count)
-                if track.get("user_emotion") != prev_emo:
-                    _emit_emotion_if_changed(track)
 
         tracks = track_manager.active_tracks()
         _emit_track_lifecycle(active_tids)

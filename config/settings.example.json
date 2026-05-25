@@ -27,7 +27,6 @@
     "min_new_embedding_distance": 0.02,
     "use_face_alignment": true,
     "async_recognition": true,
-    "emotion_skip_when_locked": true,
     "tracker_type": "kcf",
     "max_centroid_dist": 50,
     "iou_match_threshold": 0.25,
@@ -90,12 +89,7 @@
     "tts_volume": 0.9,
     "tts_cooldown_seconds": 4.0,
     "tts_anti_repeat": 5,
-    "user_emotion_enabled": false,
     "greetings_enabled": false,
-    "emotion_interval_frames": 30,
-    "emotion_interval_when_locked": 60,
-    "emotion_min_confidence": 0.3,
-    "emotion_smooth_window": 5,
     "local_llm_enabled": false,
     "ollama_base_url": "http://127.0.0.1:11434",
     "ollama_model": "llama3.2:1b",
@@ -138,5 +132,16 @@
         "voice_min_gap_seconds": 4.0,
         "event_cooldown_seconds": 2.0,
         "batch_window_ms": 150.0
-    }
+    },
+    "presence_enabled": true,
+    "presence_confirm_frames": 8,
+    "presence_confirm_window_seconds": 3.0,
+    "presence_out_timeout_seconds": 180,
+    "presence_checkin_cooldown_seconds": 600,
+    "presence_min_lock_score": 0.62,
+    "presence_use_confirm_frames_for_filter": true,
+    "presence_confidence_history_size": 20,
+    "presence_sessions_file": "presence_sessions.json",
+    "presence_console_log": true,
+    "presence_status_interval_seconds": 30
 }

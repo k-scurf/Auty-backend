@@ -2,15 +2,122 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ── Design tokens as CSS custom properties for canvas/JS access ── */
+:root {
+  --color-bg: #0F1923;
+  --color-bg-surface: #1A2736;
+  --color-bg-elevated: #243347;
+  --color-border: #243347;
+  --color-accent: #00D4AA;
+  --color-accent-blue: #3B9EFF;
+  --color-danger: #FF5B5B;
+  --color-warning: #FFB020;
+  --color-text-primary: #F0F4F8;
+  --color-text-secondary: #8BA3BB;
+  --color-text-muted: #4A6078;
+  --color-bg-success: rgba(0, 212, 170, 0.12);
+  --color-text-success: #00D4AA;
+  --color-bg-danger-soft: rgba(255, 91, 91, 0.1);
+  --color-border-danger: rgba(255, 91, 91, 0.35);
+}
+
+@keyframes enroll-flash {
+  from { opacity: 0.55; }
+  to { opacity: 0; }
+}
+
+.enroll-flash {
+  animation: enroll-flash 150ms ease-out forwards;
+}
+
+/* ── Base ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+}
+
 body {
   margin: 0;
   min-height: 100vh;
-  background: #0b0f14;
-  font-family: Inter, system-ui, sans-serif;
+  background: var(--color-bg);
+  color: var(--color-text-primary);
+  font-family: "DM Sans", system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
+/* ── Scrollbar ── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-text-muted); }
+
+/* ── Focus ring ── */
+:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* ── Component utilities ── */
 @layer components {
-  .glass-card {
-    @apply rounded-xl border border-border/80 bg-card/90 backdrop-blur-sm shadow-glow;
+  /* New card — replaces .glass-card */
+  .card {
+    @apply rounded-card border border-border bg-bg-surface shadow-card;
   }
+
+  /* Legacy alias — keep during migration */
+  .glass-card {
+    @apply rounded-card border border-border bg-bg-surface shadow-card;
+  }
+
+  /* Skeleton shimmer */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      var(--color-bg-surface) 25%,
+      var(--color-bg-elevated) 50%,
+      var(--color-bg-surface) 75%
+    );
+    background-size: 200% 100%;
+    animation: shimmer 1.6s linear infinite;
+    border-radius: 4px;
+  }
+
+  /* Pill / badge base */
+  .badge-pill {
+    @apply inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium;
+  }
+
+  /* Input base */
+  .input {
+    @apply rounded-input border border-border bg-bg-elevated px-3 py-2 text-sm text-text-primary placeholder:text-text-muted
+           focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent transition-colors;
+  }
+
+  /* Button variants */
+  .btn-primary {
+    @apply rounded-btn bg-accent px-4 py-2 text-sm font-semibold text-bg
+           hover:bg-accent/90 focus-visible:ring-2 focus-visible:ring-accent focus-visible:ring-offset-2 focus-visible:ring-offset-bg
+           disabled:opacity-40 disabled:cursor-not-allowed transition-colors;
+  }
+
+  .btn-secondary {
+    @apply rounded-btn border border-border bg-bg-elevated px-4 py-2 text-sm font-medium text-text-primary
+           hover:bg-bg-elevated hover:border-accent/40 disabled:opacity-40 disabled:cursor-not-allowed transition-colors;
+  }
+
+  .btn-ghost {
+    @apply rounded-btn px-4 py-2 text-sm font-medium text-text-secondary
+           hover:bg-bg-elevated hover:text-text-primary disabled:opacity-40 transition-colors;
+  }
+
+  .btn-danger {
+    @apply rounded-btn border border-danger/40 bg-danger/10 px-4 py-2 text-sm font-medium text-danger
+           hover:bg-danger/20 disabled:opacity-40 transition-colors;
+  }
+}
+
+/* ── Kiosk vignette effect ── */
+.kiosk-vignette-danger {
+  box-shadow: inset 0 0 80px rgba(255, 91, 91, 0.4);
 }

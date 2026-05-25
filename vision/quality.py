@@ -74,8 +74,8 @@ def assess_face(
     max_yaw = float(get_cfg("quality_max_yaw_deg", 35))
 
     subscores = []
-    if blur >= min_blur:
-        subscores.append(min(100.0, blur / min_blur * 25))
+    if min_blur <= 0 or blur >= min_blur:
+        subscores.append(min(100.0, (blur / min_blur * 25) if min_blur > 0 else 25.0))
     else:
         reasons.append("blur")
 
@@ -118,4 +118,10 @@ def passes_enroll(quality: FaceQuality) -> bool:
 
 def passes_enroll_capture(quality: FaceQuality) -> bool:
     """Relaxed quality gate used only during guided enrollment capture."""
-    return quality.quality_score >= float(get_cfg("quality_min_enroll_capture", 55))
+    min_score = float(get_cfg("quality_min_enroll_capture", 35))
+    if quality.quality_score >= min_score:
+        return True
+    # One minor issue (e.g. slight off-center) is OK if overall score is close.
+    if quality.quality_score >= min_score - 10 and len(quality.reasons) <= 1:
+        return True
+    return False

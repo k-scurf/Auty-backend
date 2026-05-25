@@ -26,7 +26,6 @@ flowchart TD
 3. **Recognition** — InsightFace ArcFace, quality gates, temporal vote + lock confirm (`vision/temporal.py`).
 
 See **`docs/PIPELINE_V2.md`** for tuning and Mac ONNX notes.
-4. **Emotion** — DeepFace emotion model, throttled per track (`user_emotion.py`).
 
 ## Events
 
@@ -34,7 +33,6 @@ Perception emits events only; it does not update the HUD directly.
 
 - `FaceDetected` / `FaceLost` — track lifecycle
 - `FaceRecognized` / `UnknownFaceDetected` — stable identity
-- `EmotionUpdated` — feeling row on HUD
 - `AttentionShifted` — primary face changed
 
 ## AI core

@@ -5,6 +5,9 @@ import { wsUrl } from "../services/api";
 const MAX_HZ = 15;
 const MIN_INTERVAL = 1000 / MAX_HZ;
 
+/** Expected while InsightFace/camera boot in a background thread — not a failure. */
+const WARMUP_ERRORS = new Set(["Engine not ready"]);
+
 export function useWebSocket() {
   const [frame, setFrame] = useState<FrameSnapshot | null>(null);
   const [connected, setConnected] = useState(false);
@@ -59,10 +62,17 @@ export function useWebSocket() {
       ws.onmessage = (ev) => {
         try {
           const data = JSON.parse(ev.data);
-          if (data.type === "error") {
-            setError(data.message || "Server error");
+          if (data.type === "status") {
             return;
           }
+          if (data.type === "error") {
+            const msg = data.message || "Server error";
+            if (!WARMUP_ERRORS.has(msg)) {
+              setError(msg);
+            }
+            return;
+          }
+          setError(null);
           scheduleUpdate(data as FrameSnapshot);
         } catch {
           /* ignore parse errors */

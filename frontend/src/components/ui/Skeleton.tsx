@@ -3,10 +3,5 @@ interface Props {
 }
 
 export function Skeleton({ className = "h-4 w-full" }: Props) {
-  return (
-    <div
-      className={`animate-pulse rounded-md bg-slate-700/50 ${className}`}
-      aria-hidden
-    />
-  );
+  return <div className={`skeleton ${className}`} aria-hidden />;
 }

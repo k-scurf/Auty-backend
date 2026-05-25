@@ -21,7 +21,7 @@ Perception modules emit **typed events** on the main thread. The **state machine
 | `DETECTING` | Face present, identity not settled |
 | `RECOGNIZED` | Known person stable |
 | `UNKNOWN` | Unknown face stable |
-| `ALERT` | Unknown persisted or strong negative emotion |
+| `ALERT` | Unknown face persisted past alert timer |
 | `ENGAGED` | Greeting / conversation window |
 
 Transitions are timer-driven (`settings.json` → `ai_states`) and event-driven (see `StateMachine`).
@@ -30,7 +30,6 @@ Transitions are timer-driven (`settings.json` → `ai_states`) and event-driven 
 
 - `FaceDetected`, `FaceLost`
 - `FaceRecognized`, `UnknownFaceDetected`
-- `EmotionUpdated`
 - `AttentionShifted`
 - `StateChanged`
 - `InteractionStarted`, `UserCommandIntent`

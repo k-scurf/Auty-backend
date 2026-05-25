@@ -1,8 +1,18 @@
 """Load merged settings (shared by API server and legacy tools)."""
 
 import json
+import os
 
-from utils.paths import LOG_PATH, MEMORY_PATH, default_settings_path
+from utils.paths import (
+    ATTENDANCE_LOG_PATH,
+    ATTENDANCE_NOTES_PATH,
+    AUDIT_LOG_PATH,
+    CONSENT_LOG_PATH,
+    LOG_PATH,
+    MEMORY_PATH,
+    PRESENCE_SESSIONS_PATH,
+    default_settings_path,
+)
 
 DEFAULT_SETTINGS = {
     "camera_index": 0,
@@ -33,7 +43,7 @@ DEFAULT_SETTINGS = {
     "enrollment_min_ready_ui": 6,
     "enrollment_target_total": 25,
     "enrollment_relaxed_pose": True,
-    "quality_min_enroll_capture": 55,
+    "quality_min_enroll_capture": 35,
     "enrollment_phase_timeout_sec": 12,
     "enrollment_provisional_prefix": "Guest",
     "preprocess_clahe_enabled": True,
@@ -67,7 +77,6 @@ DEFAULT_SETTINGS = {
     "recognition_interval_when_locked": 90,
     "recognition_locked_seconds": 6.0,
     "detect_interval_frames": 15,
-    "emotion_interval_when_locked": 60,
     "max_centroid_dist": 50,
     "iou_match_threshold": 0.25,
     "iou_duplicate_threshold": 0.15,
@@ -107,7 +116,7 @@ DEFAULT_SETTINGS = {
     "hud_fade_in": True,
     "hud_pulse_on_recognize": True,
     "hud_scan_line": False,
-    "hud_unknown_auto_snapshot": True,
+    "hud_unknown_auto_snapshot": False,
     "hud_unknown_snapshot_interval": 30,
     "confidence_threshold": 0.48,
     "min_lock_score": 0.62,
@@ -133,12 +142,10 @@ DEFAULT_SETTINGS = {
     "personality_enabled": False,
     "memory_file": "memory.json",
     "voice_enabled": False,
-    "user_emotion_enabled": False,
     "greeting_bar_enabled": False,
     "greetings_enabled": False,
     "local_llm_enabled": False,
     "async_recognition": True,
-    "emotion_skip_when_locked": True,
     "event_system_enabled": True,
     "greet_stable_frames": 2,
     "ai_states": {
@@ -152,6 +159,40 @@ DEFAULT_SETTINGS = {
     "attention_unknown_penalty": 0.25,
     "behavior_timing": {},
     "behavior_throttle": {},
+    "presence_enabled": True,
+    "presence_confirm_frames": 2,
+    "presence_confirm_window_seconds": 12.0,
+    "kiosk_fast_checkin": True,
+    "presence_out_timeout_seconds": 180,
+    "presence_checkin_cooldown_seconds": 600,
+    "presence_min_lock_score": 0.62,
+    "presence_use_confirm_frames_for_filter": True,
+    "presence_confidence_history_size": 20,
+    "presence_sessions_file": "presence_sessions.json",
+    "presence_console_log": True,
+    "presence_status_interval_seconds": 30,
+    # Attendance / payroll settings
+    "attendance_enabled": True,
+    "attendance_min_confidence": 0.75,
+    "save_clock_in_snapshot": False,
+    "location_id": "main",
+    "device_id": "default",
+    # Data governance
+    "data_retention_days": 90,
+    "timezone": "America/Chicago",
+    # Kiosk
+    "kiosk_pin": "1234",
+    "kiosk_clock_in_message": "",
+    # Consent
+    "consent_form_version": "1.0",
+    # UI / payroll preferences (stored in settings, not wired to vision logic)
+    "company_name": "",
+    "default_export_format": "gusto",
+    "pay_period_start_day": 1,
+    # L3: fail_streak_alert is a UI preference but the enforcement threshold is
+    # the module-level FAIL_STREAK_THRESHOLD constant in attendance_tracker.py;
+    # wiring them together requires passing settings into AttendanceTracker.
+    "fail_streak_alert": 3,
 }
 
 
@@ -165,4 +206,13 @@ def load_settings() -> dict:
         merged = dict(DEFAULT_SETTINGS)
     merged["memory_file"] = str(MEMORY_PATH)
     merged["log_file"] = str(LOG_PATH)
+    pf = merged.get("presence_sessions_file", "presence_sessions.json")
+    if not os.path.isabs(str(pf)):
+        merged["presence_sessions_path"] = str(PRESENCE_SESSIONS_PATH.parent / pf)
+    else:
+        merged["presence_sessions_path"] = str(pf)
+    merged["attendance_log_path"] = str(ATTENDANCE_LOG_PATH)
+    merged["attendance_notes_path"] = str(ATTENDANCE_NOTES_PATH)
+    merged["consent_log_path"] = str(CONSENT_LOG_PATH)
+    merged["audit_log_path"] = str(AUDIT_LOG_PATH)
     return merged

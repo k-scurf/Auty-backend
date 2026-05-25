@@ -1,12 +1,17 @@
-import type { ReactNode } from "react";
+import type { ReactNode, HTMLAttributes } from "react";
 
-interface Props {
+interface Props extends HTMLAttributes<HTMLDivElement> {
   children: ReactNode;
-  className?: string;
+  elevated?: boolean;
 }
 
-export function GlassCard({ children, className = "" }: Props) {
+export function GlassCard({ children, className = "", elevated = false, ...props }: Props) {
   return (
-    <div className={`glass-card p-4 ${className}`.trim()}>{children}</div>
+    <div
+      className={`card p-4 ${elevated ? "shadow-elevated bg-bg-elevated" : ""} ${className}`}
+      {...props}
+    >
+      {children}
+    </div>
   );
 }

@@ -6,11 +6,15 @@ import { ProfilesPage } from "./pages/ProfilesPage";
 import { AlertsPage } from "./pages/AlertsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { DebugPage } from "./pages/DebugPage";
+import { KioskPage } from "./pages/KioskPage";
 
 export default function App() {
   return (
     <BrowserRouter>
       <Routes>
+        {/* Kiosk runs full-screen — no AppShell chrome */}
+        <Route path="kiosk" element={<KioskPage />} />
+
         <Route element={<AppShell />}>
           <Route index element={<DashboardPage />} />
           <Route path="logs" element={<LogsPage />} />

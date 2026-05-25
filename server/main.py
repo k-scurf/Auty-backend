@@ -5,35 +5,68 @@ FastAPI entry: MJPEG stream, WebSocket frame metadata, REST API.
 from __future__ import annotations
 
 import asyncio
+import base64
+import datetime as dt
+import io
 import json
+import logging
 import os
-import signal
 import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+import cv2
+import numpy as np
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from server.auty_engine import VisionEngine, get_engine
 from server.schemas import (
+    AttendanceEventOut,
+    AttendanceNoteCreate,
+    AttendanceStatusOut,
+    ConsentCreate,
+    ConsentStatusOut,
     EnrollmentProgressOut,
+    ExportPreviewOut,
+    ExportRequest,
+    FrameCheckOut,
+    FrameCheckRequest,
     FrameSnapshotOut,
     HealthOut,
+    PresenceOut,
     ProfileCreate,
     ProfileOut,
     SettingsPatch,
+    TodayAttendanceStatusOut,
+    WeeklyScheduleIn,
+    WeeklyScheduleOut,
 )
 from server.settings_loader import DEFAULT_SETTINGS, load_settings
 from utils.paths import default_settings_path, ensure_directories
 
+from attendance_schedules import DEFAULT_TZ, DAYS, ScheduleStore, normalize_schedule
 import database as db_mod
+from payroll_export import build_export_csv, compute_preview
 
 ensure_directories()
+
+
+class _QuietFrameAccessLog(logging.Filter):
+    _SUPPRESS = ("/api/frame.jpg", "/api/attendance/active", "/api/health/status", "/api/camera/check-frame")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(s in msg for s in self._SUPPRESS)
+
+
+logging.getLogger("uvicorn.access").addFilter(_QuietFrameAccessLog())
 
 _vision: Optional[VisionEngine] = None
 _vision_boot_started = False
@@ -92,15 +125,31 @@ def _boot_vision_engine():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _vision
+    global _vision, _INDEX_BYTES
     if _ui_built():
-        print("[Auty] Dashboard: http://127.0.0.1:8000  (frontend/dist loaded)")
+        _INDEX_BYTES = _INDEX.read_bytes()
+        url = "http://127.0.0.1:8000"
+        print(f"[Auty] Dashboard: {url}  (frontend/dist loaded)")
+        print("[Auty] Live camera feed is in the browser — no separate preview window.")
+        if os.environ.get("AUTY_NO_BROWSER", "").lower() not in ("1", "true", "yes"):
+
+            def _open_browser():
+                import time
+                import webbrowser
+
+                time.sleep(1.2)
+                webbrowser.open(url)
+
+            threading.Thread(target=_open_browser, daemon=True).start()
     else:
         print("[Auty] API only — build frontend/dist then restart, or run ./scripts/dev-frontend.sh")
+        print("[Auty] Then open http://127.0.0.1:8000 — or run: cd frontend && npm run dev")
     _boot_vision_engine()
     yield
     if _vision is not None:
+        print("[Auty] Shutting down vision engine…")
         _vision.stop()
+        print("[Auty] Shutdown complete")
 
 
 app = FastAPI(title="Auty API", version="1.0.0", lifespan=lifespan)
@@ -112,7 +161,11 @@ app.add_middleware(
         "http://127.0.0.1:5173",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
+        # Allow all origins for HTTPS LAN access (iPad, etc.)
+        # The app self-hosts the frontend, so there's no cross-origin risk.
+        "https://192.168.1.100:8000",
     ],
+    allow_origin_regex=r"https?://192\.168\.\d+\.\d+(:\d+)?",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -161,12 +214,12 @@ def health_soft():
             "uptime": 0.0,
             "frame_count": 0,
         }
-    h = eng.get_health()
+    h = eng.get_health_light()
     return {
         "engine_ready": True,
         "camera_ok": h["camera_ok"],
         "db_loaded": h["db_loaded"],
-        "face_count": h["face_db_count"],
+        "face_count": h["face_count"],
         "profile_count": h["profile_count"],
         "fps": h["fps"],
         "uptime": h["uptime_seconds"],
@@ -181,7 +234,8 @@ async def _mjpeg_generator():
         if eng is None:
             await asyncio.sleep(0.1)
             continue
-        jpeg = eng.get_jpeg()
+        # Offload the threading.Lock acquisition to a thread to avoid stalling uvloop.
+        jpeg = await asyncio.to_thread(eng.get_jpeg)
         if jpeg:
             yield boundary + b"\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
         await asyncio.sleep(0.033)
@@ -198,50 +252,70 @@ async def stream_mjpeg():
     )
 
 
-_PLACEHOLDER_JPEG: bytes | None = None
+_PLACEHOLDER_CACHE: dict[str, bytes] = {}
+_INDEX_BYTES: Optional[bytes] = None
+_INDEX_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache",
+}
 
 
-def _placeholder_jpeg() -> bytes:
-    global _PLACEHOLDER_JPEG
-    if _PLACEHOLDER_JPEG is None:
-        import cv2
-        import numpy as np
+def _index_bytes() -> bytes:
+    global _INDEX_BYTES
+    if _INDEX_BYTES is None:
+        _INDEX_BYTES = _INDEX.read_bytes()
+    return _INDEX_BYTES
 
-        img = np.zeros((540, 960, 3), dtype=np.uint8)
-        cv2.putText(
-            img,
-            "Starting camera…",
-            (300, 280),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (148, 163, 184),
-            2,
-            cv2.LINE_AA,
-        )
-        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
-        _PLACEHOLDER_JPEG = buf.tobytes() if ok else b""
-    return _PLACEHOLDER_JPEG
+
+def _placeholder_jpeg(message: str = "Starting camera…") -> bytes:
+    if message in _PLACEHOLDER_CACHE:
+        return _PLACEHOLDER_CACHE[message]
+    import cv2
+    import numpy as np
+
+    img = np.zeros((540, 960, 3), dtype=np.uint8)
+    cv2.putText(
+        img,
+        message[:48],
+        (80, 260),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.85,
+        (148, 163, 184),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        img,
+        "Open http://127.0.0.1:8000 for live feed",
+        (200, 320),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (100, 116, 139),
+        1,
+        cv2.LINE_AA,
+    )
+    ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 70])
+    result = buf.tobytes() if ok else b""
+    _PLACEHOLDER_CACHE[message] = result
+    return result
+
+
+def _frame_jpeg_bytes() -> bytes:
+    """Keep this fast — runs under heavy /api/frame.jpg load."""
+    eng = vision_ref()
+    if eng is None:
+        return _placeholder_jpeg("Starting camera…")
+    jpeg = eng.get_jpeg()
+    if not jpeg:
+        return _placeholder_jpeg("Starting camera…")
+    return jpeg
 
 
 @app.get("/api/frame.jpg")
 def frame_jpeg():
     """Latest composited frame — works in all browsers (unlike MJPEG in <img>)."""
-    eng = vision_ref()
-    if eng is None:
-        return Response(
-            content=_placeholder_jpeg(),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "no-store"},
-        )
-    jpeg = eng.get_jpeg()
-    if not jpeg:
-        return Response(
-            content=_placeholder_jpeg(),
-            media_type="image/jpeg",
-            headers={"Cache-Control": "no-store"},
-        )
     return Response(
-        content=jpeg,
+        content=_frame_jpeg_bytes(),
         media_type="image/jpeg",
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
     )
@@ -254,21 +328,29 @@ async def websocket_frames(ws: WebSocket):
         while True:
             eng = vision_ref()
             if eng is None:
-                await ws.send_json(
-                    {"type": "error", "message": "Engine not ready"}
-                )
+                await ws.send_json({"type": "status", "ready": False})
                 await asyncio.sleep(1.0)
                 continue
-            snap = eng.get_snapshot()
-            if not eng.get_health()["camera_ok"]:
-                await ws.send_json(
-                    {"type": "error", "message": "Camera unavailable"}
-                )
-            else:
-                await ws.send_json(snap.model_dump())
+            # Run get_ws_broadcast() in a thread so the threading.Lock acquisition
+            # and any Pydantic model_dump() work never blocks the uvloop event thread.
+            payload = await asyncio.to_thread(eng.get_ws_broadcast)
+            await ws.send_json(payload)
             await asyncio.sleep(_ws_interval)
     except WebSocketDisconnect:
         pass
+    except RuntimeError:
+        # send/receive on a closed WebSocket raises RuntimeError in Starlette
+        pass
+    except Exception:
+        pass
+
+
+@app.get("/api/presence", response_model=PresenceOut)
+def get_presence():
+    eng = vision_ref()
+    if eng is None:
+        return PresenceOut()
+    return eng.get_presence()
 
 
 @app.get("/api/logs")
@@ -313,11 +395,73 @@ def delete_profile(profile_id: str):
     return {"ok": True}
 
 
+@app.post("/api/recognize-frame", response_model=FrameSnapshotOut)
+async def recognize_frame(file: UploadFile = File(...)):
+    """Accept a JPEG from a client device camera (e.g. iPad), run face
+    recognition, fire clock-in/out if appropriate, and return a FrameSnapshotOut.
+    This endpoint powers the iPad camera path where getUserMedia captures frames
+    that are sent here for server-side InsightFace recognition.
+    """
+    eng = require_engine()
+    jpeg_bytes = await file.read()
+    import asyncio
+    snapshot = await asyncio.to_thread(eng.recognize_client_frame, jpeg_bytes)
+    return snapshot
+
+
+@app.post("/api/profiles/reset-all")
+def reset_all_profiles():
+    """Delete every identity record, face embedding, and profile. Cannot be undone."""
+    eng = require_engine()
+
+    # ── 1. Clear on-disk face / profile data ──────────────────────────────
+    eng.db.reset(clear_captures=True)
+
+    # ── 2. Truncate attendance log (zero it out so _load_state_from_log
+    #        won't re-populate stale data on next start) ────────────────────
+    att_log = str(eng.settings.get("attendance_log_path", "data/attendance_log.jsonl"))
+    att_notes = str(eng.settings.get("attendance_notes_path", "data/attendance_notes.json"))
+    try:
+        open(att_log, "w").close()
+    except OSError:
+        pass
+    try:
+        with open(att_notes, "w") as f:
+            f.write("{}")
+    except OSError:
+        pass
+
+    # ── 3. Clear presence sessions file ──────────────────────────────────
+    pres_path = str(eng.settings.get("presence_sessions_path", "data/presence_sessions.json"))
+    try:
+        with open(pres_path, "w") as f:
+            f.write("{}")
+    except OSError:
+        pass
+
+    # ── 4. Flush all in-memory state ─────────────────────────────────────
+    eng.track_manager.reset()
+    eng.attendance_tracker.reset()
+    eng.presence_tracker.reset()
+    eng._kiosk_last_action.clear()
+    if hasattr(eng, "_kiosk_acted_track_ids"):
+        eng._kiosk_acted_track_ids.clear()
+    eng.session_log.clear()
+    eng._enrollment["auto_committed"] = False
+    eng._enrollment["provisional_name"] = None
+    from vision.matcher import sync_gallery
+    sync_gallery(eng.db.face_db, eng.db.store)
+    return {"ok": True}
+
+
 @app.post("/api/enrollment/start")
 def enrollment_start(track_id: int | None = None):
     eng = require_engine()
     if not eng.start_guided_enrollment(track_id):
-        raise HTTPException(status_code=400, detail="No face to enroll")
+        raise HTTPException(
+            status_code=400,
+            detail="No face detected — center your face in the camera and hold still",
+        )
     return {"ok": True}
 
 
@@ -360,16 +504,220 @@ def profile_photo(name: str):
     return FileResponse(path, media_type="image/jpeg")
 
 
+def _classify_save_error(msg: str) -> str:
+    """Map a save_profile error string to a structured error code."""
+    m = msg.lower()
+    if msg.startswith("MULTIPLE_FACES:"):
+        return "MULTIPLE_FACES"
+    if msg.startswith("NO_FACE_DETECTED:"):
+        return "NO_FACE_DETECTED"
+    if msg.startswith("LOW_CONFIDENCE:"):
+        return "LOW_CONFIDENCE"
+    if "name is required" in m:
+        return "INVALID_INPUT"
+    if "no face ready" in m:
+        return "NO_FACE_READY"
+    if "could not generate embedding" in m or "check lighting" in m:
+        return "NO_FACE_DETECTED"
+    if "could not rename" in m:
+        return "RENAME_FAILED"
+    if "already enrolled" in m or "duplicate" in m:
+        return "ALREADY_ENROLLED"
+    if "consent" in m:
+        return "CONSENT_MISSING"
+    if "enrollment failed" in m:
+        return "ENROLLMENT_FAILED"
+    return "MODEL_ERROR"
+
+
+def _action_for_code(code: str) -> str:
+    return {
+        "NO_FACE_DETECTED": "retake",
+        "MULTIPLE_FACES": "retake",
+        "NO_FACE_READY": "retake_all",
+        "LOW_CONFIDENCE": "retake_all",
+        "INVALID_INPUT": "fix_input",
+        "RENAME_FAILED": "retry",
+        "ALREADY_ENROLLED": "view_existing",
+        "CONSENT_MISSING": "restart",
+        "ENROLLMENT_FAILED": "retry",
+        "MODEL_ERROR": "retry",
+    }.get(code, "retry")
+
+
+def _decode_b64_image(image_b64: str):
+    """Return BGR numpy array or None."""
+    try:
+        payload = image_b64.strip()
+        if "," in payload and payload.startswith("data:"):
+            payload = payload.split(",", 1)[1]
+        raw = base64.b64decode(payload)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        return cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+
+
+def _validate_enrollment_images(images: list) -> Optional[dict]:
+    """Validate each submitted photo; return error detail dict or None."""
+    from vision.detector import detect as _detect
+
+    for i, img_b64 in enumerate(images):
+        frame = _decode_b64_image(img_b64)
+        if frame is None or frame.size == 0:
+            return {
+                "code": "NO_FACE_DETECTED",
+                "message": f"No face detected in photo {i + 1}",
+                "photo_index": i,
+                "action": "retake",
+            }
+        faces = _detect(frame, max_faces=3)
+        if len(faces) == 0:
+            return {
+                "code": "NO_FACE_DETECTED",
+                "message": f"No face detected in photo {i + 1}",
+                "photo_index": i,
+                "action": "retake",
+            }
+        if len(faces) > 1:
+            return {
+                "code": "MULTIPLE_FACES",
+                "message": (
+                    f"Multiple faces detected in photo {i + 1}. "
+                    "Only one person should be in frame."
+                ),
+                "photo_index": i,
+                "action": "retake",
+            }
+    return None
+
+
 @app.post("/api/profiles")
 def create_profile(body: ProfileCreate):
     eng = require_engine()
+
+    # Device-camera 3-photo flow: first image is primary, rest add extra embeddings.
+    primary_b64 = body.image_b64
+    extra_images: Optional[list] = None
+    if body.images:
+        if len(body.images) != 3:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "INVALID_INPUT",
+                    "message": "Exactly 3 photos are required to enroll.",
+                    "action": "retake_all",
+                },
+            )
+        validation_err = _validate_enrollment_images(body.images)
+        if validation_err:
+            raise HTTPException(status_code=422, detail=validation_err)
+        if not primary_b64:
+            primary_b64 = body.images[0]
+        if len(body.images) > 1:
+            extra_images = body.images[1:]
+
     ok, msg = eng.save_profile(
-        body.name, body.age, body.status, image_b64=body.image_b64
+        body.name, body.age, body.status,
+        image_b64=primary_b64,
+        extra_images=extra_images,
+        allow_low_confidence=body.allow_low_confidence,
     )
     if not ok:
-        print(f"[Auty] POST /api/profiles rejected: {msg}")
-        raise HTTPException(status_code=400, detail=msg)
+        code = _classify_save_error(msg)
+        status = 422 if code in (
+            "NO_FACE_DETECTED", "MULTIPLE_FACES", "LOW_CONFIDENCE", "ALREADY_ENROLLED"
+        ) else 400
+        detail = {"code": code, "message": msg, "action": _action_for_code(code)}
+        if code == "LOW_CONFIDENCE" and ":" in msg:
+            try:
+                detail["confidence"] = float(msg.split(":")[-1])
+            except ValueError:
+                pass
+        if code in ("NO_FACE_DETECTED", "MULTIPLE_FACES") and ":" in msg:
+            try:
+                detail["photo_index"] = int(msg.rsplit(":", 1)[-1])
+            except ValueError:
+                pass
+        print(f"[Auty] POST /api/profiles rejected [{code}]: {msg}")
+        raise HTTPException(status_code=status, detail=detail)
     return {"ok": True, "name": msg}
+
+
+@app.post("/api/camera/check-frame", response_model=FrameCheckOut)
+def check_enrollment_frame(body: FrameCheckRequest):
+    """
+    Decode a base-64 JPEG sent from the device camera and return three quality
+    signals used by the enrollment wizard to gate the Capture button.
+    """
+    from vision.insightface_app import models_ready as _models_ready
+    from vision.detector import detect as _detect
+
+    if not _models_ready():
+        return FrameCheckOut(face_detected=False, message="models_loading")
+
+    # Decode the image
+    try:
+        payload = body.image_b64.strip()
+        if "," in payload and payload.startswith("data:"):
+            payload = payload.split(",", 1)[1]
+        raw = base64.b64decode(payload)
+        arr = np.frombuffer(raw, dtype=np.uint8)
+        frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return FrameCheckOut(face_detected=False, message="decode_error")
+
+    if frame is None or frame.size == 0:
+        return FrameCheckOut(face_detected=False, message="empty_frame")
+
+    fh, fw = frame.shape[:2]
+
+    # Basic lighting check on the whole frame (fast path — no face required)
+    gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    brightness_full = float(gray_full.mean())
+    frame_lighting_ok = 55 <= brightness_full <= 225
+
+    faces = _detect(frame, max_faces=3)
+    if not faces:
+        return FrameCheckOut(
+            face_detected=False,
+            face_count=0,
+            lighting_ok=frame_lighting_ok,
+            centered=False,
+        )
+
+    if len(faces) > 1:
+        return FrameCheckOut(
+            face_detected=False,
+            face_count=len(faces),
+            lighting_ok=frame_lighting_ok,
+            centered=False,
+            message="multiple_faces",
+        )
+
+    face = faces[0]
+    x, y, w, h = face.bbox
+
+    # Lighting: mean brightness of the face crop
+    cx1, cy1 = max(0, x), max(0, y)
+    cx2, cy2 = min(fw, x + w), min(fh, y + h)
+    crop_gray = gray_full[cy1:cy2, cx1:cx2]
+    brightness_face = float(crop_gray.mean()) if crop_gray.size > 0 else brightness_full
+    lighting_ok = 55 <= brightness_face <= 225
+
+    # Centering: face centre within 25 % of frame dimensions from frame centre
+    face_cx = x + w / 2.0
+    face_cy = y + h / 2.0
+    dx = abs(face_cx - fw / 2.0) / fw
+    dy = abs(face_cy - fh / 2.0) / fh
+    centered = dx <= 0.25 and dy <= 0.25
+
+    return FrameCheckOut(
+        face_detected=True,
+        face_count=len(faces),
+        lighting_ok=lighting_ok,
+        centered=centered,
+    )
 
 
 @app.post("/api/enrollment/skip")
@@ -379,16 +727,393 @@ def skip_enrollment():
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+_schedule_store = ScheduleStore()
+
+
+def _employee_records(eng: VisionEngine) -> list[dict]:
+    profiles = eng.db.load_profiles()
+    out: list[dict] = []
+    for name, profile in profiles.items():
+        rec = eng.db.store.find_by_name(name)
+        employee_id = str(rec.id if rec else profile.get("id") or name)
+        out.append(
+            {
+                "employee_id": employee_id,
+                "name": str(profile.get("name") or name),
+            }
+        )
+    return out
+
+
+def _tz(name: str):
+    try:
+        return ZoneInfo(name)
+    except Exception:
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def _local_time(date: dt.date, hhmm: str, tzinfo) -> dt.datetime:
+    hour, minute = [int(part) for part in hhmm.split(":", 1)]
+    return dt.datetime.combine(date, dt.time(hour, minute), tzinfo=tzinfo)
+
+
+def _format_ts(ts: Optional[float], tzinfo) -> Optional[str]:
+    if ts is None:
+        return None
+    return dt.datetime.fromtimestamp(ts, tzinfo).strftime("%H:%M")
+
+
+def _today_events_for_employee(events: list[dict], employee_id: str, name: str, today: dt.date, tzinfo) -> list[dict]:
+    matched = []
+    for ev in events:
+        if str(ev.get("employee_id") or "") != employee_id and ev.get("name") != name:
+            continue
+        ts = float(ev.get("timestamp_ts") or 0.0)
+        if dt.datetime.fromtimestamp(ts, tzinfo).date() == today:
+            matched.append(ev)
+    return sorted(matched, key=lambda e: float(e.get("timestamp_ts") or 0.0))
+
+
+def _first_shift_pair(events: list[dict]) -> tuple[Optional[dict], Optional[dict]]:
+    clock_in = None
+    for ev in events:
+        if ev.get("event") == "CLOCK_IN" and clock_in is None:
+            clock_in = ev
+        elif ev.get("event") == "CLOCK_OUT" and clock_in is not None:
+            return clock_in, ev
+    return clock_in, None
+
+
+def _status_alert(status: str, name: str, minutes: int, shift_start: Optional[str], shift_end: Optional[str]) -> Optional[str]:
+    if status == "late" and shift_start:
+        return f"{name} is {minutes} minutes late (shift started at {shift_start})"
+    if status == "missing_clockout" and shift_end:
+        return f"{name} hasn't clocked out (shift ended at {shift_end})"
+    if status == "absent":
+        return f"{name} has not clocked in today"
+    return None
+
+
+@app.get("/api/schedules/{employee_id}", response_model=WeeklyScheduleOut)
+def get_schedule(employee_id: str):
+    saved = _schedule_store.get(employee_id)
+    if not saved:
+        raise HTTPException(status_code=404, detail="No schedule saved")
+    return WeeklyScheduleOut(**saved)
+
+
+@app.post("/api/schedules/{employee_id}", response_model=WeeklyScheduleOut)
+def save_schedule(employee_id: str, body: WeeklyScheduleIn):
+    data = body.model_dump()
+    data["employee_id"] = employee_id
+    saved = _schedule_store.save(employee_id, data)
+    return WeeklyScheduleOut(**saved)
+
+
+# ---------------------------------------------------------------------------
+# Attendance routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/attendance/active")
+def get_attendance_active():
+    """Who is clocked in right now."""
+    eng = vision_ref()
+    if eng is None:
+        return {"clocked_in": [], "recent_events": [], "alerts": []}
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        return {"clocked_in": [], "recent_events": [], "alerts": []}
+    return tracker.snapshot_dict()
+
+
+@app.get("/api/attendance/status/today", response_model=TodayAttendanceStatusOut)
+def get_today_attendance_status():
+    """Every employee's schedule-aware attendance status for today."""
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        return TodayAttendanceStatusOut(date=dt.date.today().isoformat(), rows=[])
+
+    now_default = dt.datetime.now(_tz(DEFAULT_TZ))
+    all_events = tracker.get_events()
+    schedules = _schedule_store.all()
+    rows = []
+
+    for employee in _employee_records(eng):
+        employee_id = employee["employee_id"]
+        name = employee["name"]
+        schedule = schedules.get(employee_id)
+        if schedule is None:
+            rows.append(
+                {
+                    "employee_id": employee_id,
+                    "name": name,
+                    "status": "no_schedule",
+                    "has_schedule": False,
+                }
+            )
+            continue
+
+        tz_name = schedule.get("timezone") or DEFAULT_TZ
+        tzinfo = _tz(tz_name)
+        now = dt.datetime.now(tzinfo)
+        today = now.date()
+        day_key = DAYS[today.weekday()]
+        shift = (schedule.get("days") or {}).get(day_key) or {}
+        working = bool(shift.get("working"))
+        shift_start = shift.get("start")
+        shift_end = shift.get("end")
+
+        today_events = _today_events_for_employee(all_events, employee_id, name, today, tzinfo)
+        clock_in, clock_out = _first_shift_pair(today_events)
+        clock_in_ts = float(clock_in.get("timestamp_ts")) if clock_in else None
+        clock_out_ts = float(clock_out.get("timestamp_ts")) if clock_out else None
+
+        if not working:
+            status = "day_off"
+            start_dt = end_dt = None
+        else:
+            start_dt = _local_time(today, str(shift_start or "09:00"), tzinfo)
+            end_dt = _local_time(today, str(shift_end or "17:00"), tzinfo)
+            if end_dt <= start_dt:
+                end_dt += dt.timedelta(days=1)
+
+            if clock_in_ts is None:
+                status = "absent" if now >= start_dt else "on_time"
+            elif clock_out_ts is not None:
+                status = "complete"
+            elif now >= end_dt:
+                status = "missing_clockout"
+            else:
+                clock_in_dt = dt.datetime.fromtimestamp(clock_in_ts, tzinfo)
+                status = "late" if clock_in_dt > start_dt else "on_time"
+
+        end_for_hours = clock_out_ts or (now.timestamp() if clock_in_ts is not None else None)
+        hours = None
+        if clock_in_ts is not None and end_for_hours is not None:
+            hours = round(max(0.0, (end_for_hours - clock_in_ts) / 3600.0), 2)
+
+        minutes_late = 0
+        if working and start_dt is not None:
+            ref_ts = clock_in_ts if clock_in_ts is not None else now.timestamp()
+            minutes_late = max(0, round((ref_ts - start_dt.timestamp()) / 60))
+
+        rows.append(
+            {
+                "employee_id": employee_id,
+                "name": name,
+                "status": status,
+                "shift_start": shift_start if working else None,
+                "shift_end": shift_end if working else None,
+                "timezone": tz_name,
+                "clock_in_ts": clock_in_ts,
+                "clock_out_ts": clock_out_ts,
+                "clock_in_time": _format_ts(clock_in_ts, tzinfo),
+                "clock_out_time": _format_ts(clock_out_ts, tzinfo),
+                "hours": hours,
+                "has_schedule": True,
+                "day_off": not working,
+                "alert": _status_alert(status, name, minutes_late, shift_start, shift_end),
+            }
+        )
+
+    return TodayAttendanceStatusOut(
+        date=now_default.date().isoformat(),
+        timezone=DEFAULT_TZ,
+        rows=rows,
+    )
+
+
+@app.get("/api/attendance/events")
+def get_attendance_events(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    employee: Optional[str] = None,
+    location_id: Optional[str] = None,
+):
+    """Filterable attendance event log."""
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        return []
+
+    start_ts: Optional[float] = None
+    end_ts: Optional[float] = None
+    if start_date:
+        try:
+            start_ts = dt.datetime.strptime(start_date, "%Y-%m-%d").replace(
+                tzinfo=dt.timezone.utc
+            ).timestamp()
+        except ValueError:
+            pass
+    if end_date:
+        try:
+            end_ts = (
+                dt.datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    tzinfo=dt.timezone.utc
+                )
+                + dt.timedelta(days=1)
+            ).timestamp()
+        except ValueError:
+            pass
+
+    events = tracker.get_events(
+        start_ts=start_ts,
+        end_ts=end_ts,
+        employee_name=employee,
+        location_id=location_id,
+    )
+    return events
+
+
+@app.post("/api/attendance/notes")
+def add_attendance_note(body: AttendanceNoteCreate):
+    """Add a manager note to an event (never modifies the original record)."""
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        raise HTTPException(status_code=503, detail="Attendance tracker not ready")
+    ok = tracker.add_note(body.event_id, body.note, body.manager)
+    if not ok:
+        raise HTTPException(status_code=404, detail="Event not found")
+    return {"ok": True}
+
+
+@app.get("/api/attendance/export/preview", response_model=ExportPreviewOut)
+def preview_export(
+    format: str = "gusto",
+    start_date: str = "",
+    end_date: str = "",
+    location_id: Optional[str] = None,
+):
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        raise HTTPException(status_code=503, detail="Attendance tracker not ready")
+    tz_name = str(eng.settings.get("timezone", "UTC"))
+    preview = compute_preview(tracker, format, start_date, end_date, location_id, tz_name=tz_name)
+    return ExportPreviewOut(**preview)
+
+
+@app.post("/api/attendance/export")
+def export_attendance(body: ExportRequest):
+    """Generate a payroll CSV for download."""
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        raise HTTPException(status_code=503, detail="Attendance tracker not ready")
+
+    tz_name = str(eng.settings.get("timezone", "UTC"))
+    csv_content = build_export_csv(
+        tracker,
+        body.format,
+        body.start_date,
+        body.end_date,
+        body.location_id,
+        tz_name=tz_name,
+    )
+    filename = f"attendance_{body.format}_{body.start_date}_{body.end_date}.csv"
+
+    audit = eng.get_audit_log()
+    if audit:
+        audit.log("export", actor="manager", detail=f"{body.format} {body.start_date}–{body.end_date}")
+
+    return StreamingResponse(
+        io.BytesIO(csv_content.encode("utf-8")),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Consent routes
+# ---------------------------------------------------------------------------
+
+@app.post("/api/consent")
+async def record_consent(body: ConsentCreate, request: Request):
+    eng = require_engine()
+    consent_mgr = eng.get_consent_manager()
+    ip = body.ip_address or (request.client.host if request.client else "unknown")
+    consent_mgr.record_consent(
+        employee_id=body.employee_id,
+        name=body.name,
+        ip_address=ip,
+        form_version=body.form_version,
+    )
+    return {"ok": True}
+
+
+@app.get("/api/consent/{employee_id}", response_model=ConsentStatusOut)
+def get_consent_status(employee_id: str):
+    eng = require_engine()
+    consent_mgr = eng.get_consent_manager()
+    record = consent_mgr.get_consent(employee_id)
+    if record is None:
+        return ConsentStatusOut(employee_id=employee_id, consented=False)
+    return ConsentStatusOut(
+        employee_id=employee_id,
+        consented=record.get("consent_given", False),
+        timestamp_utc=record.get("timestamp_utc"),
+        form_version=record.get("form_version"),
+    )
+
+
+@app.post("/api/consent/{employee_id}/delete")
+async def request_data_deletion(employee_id: str, request: Request):
+    eng = require_engine()
+    consent_mgr = eng.get_consent_manager()
+    consent_mgr.request_deletion(employee_id)
+    eng.get_audit_log().log(
+        "deletion_request",
+        actor=employee_id,
+        detail="Employee requested biometric data deletion",
+    )
+
+    return {"ok": True, "message": "Deletion request recorded. Account owner has been notified."}
+
+
+@app.get("/api/audit")
+def get_audit_log(limit: int = 50):
+    """Return the last N audit log entries."""
+    eng = vision_ref()
+    if eng is None:
+        return []
+    audit = eng.get_audit_log()
+    if audit is None:
+        return []
+    return audit.tail(limit)
+
+
 @app.get("/api/settings")
 def get_settings():
-    eng = require_engine()
+    # L1: kiosk_pin is included so the kiosk page can compare it client-side.
+    # For deployments exposed beyond localhost, move PIN verification to a
+    # dedicated server-side endpoint and exclude kiosk_pin from this response.
+    eng = vision_ref()
+    if eng is None:
+        return load_settings()
     return eng.settings
 
 
 @app.patch("/api/settings")
 def patch_settings(body: SettingsPatch):
     eng = require_engine()
-    allowed = set(DEFAULT_SETTINGS.keys())
+    _extra_allowed = {
+        "attendance_enabled", "attendance_min_confidence", "save_clock_in_snapshot",
+        "location_id", "device_id", "data_retention_days", "timezone",
+        "kiosk_pin", "consent_form_version",
+        # UI / payroll preferences — stored in settings.json
+        "company_name", "kiosk_clock_in_message",
+        "default_export_format", "pay_period_start_day", "fail_streak_alert",
+        # L1: kiosk_pin is returned in GET /api/settings so the frontend can compare it
+        # client-side.  For stronger security, move PIN comparison to the server and
+        # exclude kiosk_pin from the GET response.
+    }
+    allowed = set(DEFAULT_SETTINGS.keys()) | _extra_allowed
     updates = {k: v for k, v in body.settings.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="No valid keys to update")
@@ -406,14 +1131,13 @@ def patch_settings(body: SettingsPatch):
 
     rec.configure(eng.settings)
     vcfg.configure(eng.settings)
-    eng._emotion_enabled = bool(eng.settings.get("user_emotion_enabled", False))
-    eng.emotion_analyzer = __import__(
-        "user_emotion", fromlist=["UserEmotionAnalyzer"]
-    ).UserEmotionAnalyzer(eng.settings)
     re = eng.response_engine
     re.greetings_enabled = bool(eng.settings.get("greetings_enabled", False))
     re.personality_enabled = bool(eng.settings.get("personality_enabled", False))
     re.greeting_bar_enabled = bool(eng.settings.get("greeting_bar_enabled", False))
+    audit = eng.get_audit_log()
+    if audit:
+        audit.log("settings_change", actor="manager", detail=str(list(updates.keys())))
     return eng.settings
 
 
@@ -422,28 +1146,29 @@ if _ASSETS.is_dir():
 
 
 @app.get("/")
-def root():
+async def root():
     if _ui_built():
-        return FileResponse(_INDEX, media_type="text/html")
+        return Response(
+            content=_index_bytes(),
+            media_type="text/html",
+            headers=_INDEX_HEADERS,
+        )
     return HTMLResponse(_DEV_HINT)
 
 
 @app.get("/{full_path:path}")
-def spa_fallback(full_path: str):
+async def spa_fallback(full_path: str):
     """React Router paths (e.g. /logs) — serve index.html when UI is built."""
     if full_path.startswith("api/"):
         raise HTTPException(status_code=404, detail="Not found")
     if _ui_built():
-        return FileResponse(_INDEX, media_type="text/html")
+        return Response(
+            content=_index_bytes(),
+            media_type="text/html",
+            headers=_INDEX_HEADERS,
+        )
     raise HTTPException(status_code=404, detail="UI not built")
 
 
-def _shutdown_handler(signum, frame):
-    eng = vision_ref()
-    if eng:
-        eng.stop()
-    raise SystemExit(0)
-
-
-signal.signal(signal.SIGINT, _shutdown_handler)
-signal.signal(signal.SIGTERM, _shutdown_handler)
+# Shutdown is handled by FastAPI lifespan (eng.stop()). Do not run heavy cleanup
+# inside a signal handler — it races uvicorn and can hang on "Waiting for shutdown".

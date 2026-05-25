@@ -8,7 +8,7 @@ Real-time facial recognition with multi-face tracking, ArcFace identity matching
 
 - Live webcam feed with face detection, tracking, and recognition
 - Enrollment flow for unknown visitors (name, age, status)
-- HUD profile cards, emotion hints, and screen effects
+- HUD profile cards and screen effects
 - Event bus + 6-state AI FSM (`IDLE` → `DETECTING` → `RECOGNIZED` / `UNKNOWN` → `ENGAGED`)
 - Multi-step greeting sequences, attention on primary face, response throttling
 - Optional TTS and voice commands; optional Ollama conversation (local only)

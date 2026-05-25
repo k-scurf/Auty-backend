@@ -76,11 +76,6 @@ class Memory:
             self._saver.mark_dirty()
             self._saver.maybe_flush()
 
-    def get_emotion_history(self, name: str, limit: int = 10) -> List[dict]:
-        entry = self.social.data.get(name, {})
-        hist = entry.get("history", [])
-        return [h for h in hist if h.get("event") == "emotion"][-limit:]
-
     def get_relationship_tier(self, name: str, profiles: dict) -> str:
         return self.social.get_relationship_tier(name, profiles)
 

@@ -76,6 +76,9 @@ def apply_embedding_to_track(face_db: dict, track: dict, embedding):
 
 
 def recognize_track(face_db: dict, track: dict, bgr_crop, kps=None):
+    from vision.matcher import sync_gallery
+    if face_db:
+        sync_gallery(face_db)
     embedding = extract_embedding(bgr_crop, already_aligned=is_aligned_crop(bgr_crop), kps=kps)
     apply_embedding_to_track(face_db, track, embedding)
 

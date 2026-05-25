@@ -13,28 +13,34 @@ const defaultStatus: HealthStatus = {
   frame_count: 0,
 };
 
-export function useSystemStatus(pollMs = 5000) {
+export function useSystemStatus() {
   const [status, setStatus] = useState<HealthStatus>(defaultStatus);
 
   useEffect(() => {
     let active = true;
+    let timer: ReturnType<typeof setTimeout>;
 
     const poll = async () => {
+      let nextMs = 5000;
       try {
         const data = await fetchHealthSoft();
-        if (active) setStatus(data);
+        if (active) {
+          setStatus(data);
+          nextMs = data.engine_ready ? 5000 : 1000;
+        }
       } catch {
         if (active) setStatus(defaultStatus);
+        nextMs = 1000;
       }
+      if (active) timer = setTimeout(poll, nextMs);
     };
 
     poll();
-    const id = setInterval(poll, pollMs);
     return () => {
       active = false;
-      clearInterval(id);
+      clearTimeout(timer);
     };
-  }, [pollMs]);
+  }, []);
 
   return status;
 }

@@ -9,10 +9,3 @@ fastapi>=0.115.0
 uvicorn[standard]>=0.32.0
 python-multipart>=0.0.12
 pydantic>=2.0.0
-
-# Optional — emotion analysis (DeepFace); not on hot path
-# deepface>=0.0.90
-# tensorflow>=2.16.0
-# tf-keras>=2.16.0
-# retina-face>=0.0.17
-# mediapipe>=0.10.9

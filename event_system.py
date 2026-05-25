@@ -42,13 +42,6 @@ class UnknownFaceDetected(Event):
 
 
 @dataclass
-class EmotionUpdated(Event):
-    track_id: int = 0
-    emotion: str = ""
-    confidence_pct: int = 0
-
-
-@dataclass
 class AttentionShifted(Event):
     previous_track_id: Optional[int] = None
     track_id: Optional[int] = None

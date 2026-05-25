@@ -36,17 +36,6 @@ def handle_intent(
             say("I don't recognize you yet. Look at the camera to enroll.")
         return
 
-    if intent == "feeling":
-        if primary:
-            feeling = brain._feeling_label(primary)
-            if feeling != "—":
-                say(f"You look {feeling.split('(')[0].strip().lower()} to me.")
-            else:
-                say("I'm still reading your expression. Hold still a moment.")
-        else:
-            say("I don't see anyone in frame.")
-        return
-
     if intent == "greet":
         if name != "UNKNOWN":
             if brain.personality_enabled:
@@ -79,8 +68,7 @@ def handle_intent(
 
     if intent == "help":
         say(
-            "You can say: who am I, how am I feeling, say hello, "
-            "repeat, status, mute, or unmute."
+            "You can say: who am I, say hello, repeat, status, mute, or unmute."
         )
         return
 

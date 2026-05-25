@@ -13,7 +13,6 @@ if TYPE_CHECKING:
     from timing_controller import TimingController
 
 from event_system import (
-    EmotionUpdated,
     Event,
     FaceDetected,
     FaceLost,
@@ -32,9 +31,6 @@ class AIState(str, Enum):
     ENGAGED = "ENGAGED"
 
 
-ALERT_EMOTIONS = frozenset({"angry", "fear", "disgust"})
-
-
 @dataclass
 class FSMContext:
     has_faces: bool = False
@@ -45,7 +41,6 @@ class FSMContext:
     face_lost_since: Optional[float] = None
     unknown_since: Optional[float] = None
     engaged_until: float = 0.0
-    last_alert_emotion_ts: float = 0.0
 
 
 class StateMachine:
@@ -84,8 +79,6 @@ class StateMachine:
                 apply(self._on_face_recognized(event, now))
             elif isinstance(event, UnknownFaceDetected):
                 apply(self._on_unknown(event, now))
-            elif isinstance(event, EmotionUpdated):
-                apply(self._on_emotion(event, now))
 
         for tr in self._tick_timers(now):
             apply(tr)
@@ -142,13 +135,6 @@ class StateMachine:
             self.ctx.unknown_since = now
         if self.state in (AIState.IDLE, AIState.DETECTING, AIState.RECOGNIZED):
             return self._transition(AIState.UNKNOWN, "unknown_face")
-        return None
-
-    def _on_emotion(self, event: EmotionUpdated, now: float) -> Optional[StateChanged]:
-        if event.emotion.lower() in ALERT_EMOTIONS:
-            self.ctx.last_alert_emotion_ts = now
-            if self.state in (AIState.UNKNOWN, AIState.DETECTING):
-                return self._transition(AIState.ALERT, f"emotion_{event.emotion}")
         return None
 
     def _tick_timers(self, now: float) -> List[StateChanged]:

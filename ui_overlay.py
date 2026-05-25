@@ -129,11 +129,9 @@ class HUDRenderer:
         known = locked != "UNKNOWN"
         theme = THEME_KNOWN if known else THEME_UNKNOWN
         memory_line = ""
-        user_feeling = "—"
         if brain_ctx is not None:
             theme = brain_ctx.track_themes.get(tid, theme)
             memory_line = brain_ctx.memory_lines.get(tid, "")
-            user_feeling = brain_ctx.user_feelings.get(tid, "—")
         score = track.get("locked_score")
         conf_pct = int(score * 100) if score is not None and score >= 0 else 0
 
@@ -209,11 +207,6 @@ class HUDRenderer:
         self._draw_row(draw, x1 + pad, row_y, "Age", age, fonts, theme, fade, label_w=label_w)
         row_y += int(22 * scale)
         self._draw_row(draw, x1 + pad, row_y, "Status", status, fonts, theme, fade, label_w=label_w)
-        if self._cfg("user_emotion_enabled", False):
-            row_y += int(22 * scale)
-            self._draw_row(
-                draw, x1 + pad, row_y, "Feeling", user_feeling, fonts, theme, fade, label_w=label_w
-            )
 
         if memory_line:
             row_y += int(20 * scale)

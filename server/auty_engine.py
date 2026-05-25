@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import base64
 import os
+import queue
 import re
 import threading
 import time
@@ -17,6 +18,10 @@ import cv2
 import numpy as np
 
 from utils.paths import ensure_directories, migrate_legacy_data
+from presence_tracker import PresenceTracker, PresenceTransition, presence_to_api_dict
+from attendance_tracker import AttendanceTracker
+from audit_log import AuditLog
+from consent_manager import ConsentManager
 
 ensure_directories()
 migrate_legacy_data()
@@ -33,11 +38,9 @@ import recognition_worker
 import tracking as track_engine
 import camera as camera_mod
 import ui_overlay
-import user_emotion
 from attention_manager import AttentionManager
 from event_system import (
     AttentionShifted,
-    EmotionUpdated,
     EventBus,
     FaceDetected,
     FaceLost,
@@ -51,10 +54,12 @@ from state_machine import AIState, FSMContext, StateMachine
 from timing_controller import TimingController
 
 from server.schemas import (
+    AttendanceEventOut,
     EnrollmentPendingOut,
     EnrollmentProgressOut,
     FrameSnapshotOut,
     LogEntryOut,
+    PresenceOut,
     TrackOut,
 )
 from server.settings_loader import load_settings
@@ -63,6 +68,8 @@ PROCESS_W, PROCESS_H = 960, 540
 ENROLL_SAMPLE_COUNT = 12
 ENROLL_FRAME_GAP = 3
 ENROLL_COOLDOWN_SEC = 5
+# Guided enrollment uses direct RetinaFace/Haar detection — not tracker IDs.
+ENROLLMENT_DIRECT_TRACK_ID = 0
 
 
 def _sanitize_name(name: str) -> str:
@@ -81,6 +88,7 @@ class _FrameSnapshot:
     fps: float
     jpeg: bytes
     payload: FrameSnapshotOut
+    ws_payload: dict
     camera_ok: bool = True
 
 
@@ -141,13 +149,11 @@ class VisionEngine:
         self.response_engine = ResponseEngine(
             self.settings, self.event_bus, self.fsm, self.memory
         )
-        self.emotion_analyzer = user_emotion.UserEmotionAnalyzer(self.settings)
         self.rec_worker = recognition_worker.RecognitionWorker()
         self.hud_renderer = ui_overlay.HUDRenderer(
             self.settings, db_mod.CAPTURE_FOLDER
         )
 
-        self._emotion_enabled = bool(self.settings.get("user_emotion_enabled", False))
         self._event_system_enabled = bool(
             self.settings.get("event_system_enabled", True)
         )
@@ -169,8 +175,44 @@ class VisionEngine:
             self.event_bus.subscribe(StateChanged, self._on_state_changed)
 
         self.session_log = SessionLog()
+        sessions_path = str(
+            self.settings.get(
+                "presence_sessions_path",
+                self.settings.get("presence_sessions_file", "presence_sessions.json"),
+            )
+        )
+        self.presence_tracker = PresenceTracker(
+            self.settings,
+            sessions_path=sessions_path,
+            on_transition=self._on_presence_transition,
+        )
+        self.attendance_tracker = AttendanceTracker(
+            log_path=str(self.settings.get("attendance_log_path", "data/attendance_log.jsonl")),
+            notes_path=str(self.settings.get("attendance_notes_path", "data/attendance_notes.json")),
+            location_id=str(self.settings.get("location_id", "main")),
+            device_id=str(self.settings.get("device_id", "default")),
+            min_confidence=float(
+                self.settings.get("attendance_min_confidence", 0.75)
+            ),
+            provisional_prefix=str(
+                self.settings.get("enrollment_provisional_prefix", "Guest")
+            ),
+            on_alert=self._on_attendance_alert,
+        )
+        self.audit_log = AuditLog(
+            log_path=str(self.settings.get("audit_log_path", "data/audit_log.jsonl")),
+        )
+        self.consent_manager = ConsentManager(
+            log_path=str(self.settings.get("consent_log_path", "data/consent_log.json")),
+            form_version=str(self.settings.get("consent_form_version", "1.0")),
+        )
         self._lock = threading.Lock()
+        self._enroll_lock = threading.Lock()
+        self._camera_frame_idx = 0
         self._latest: Optional[_FrameSnapshot] = None
+        self._preview_jpeg: bytes = b""
+        self._camera_stream_ok = False
+        self._frame_queue: queue.Queue = queue.Queue(maxsize=1)
         self._started_at = time.time()
         self._fps_ema = 0.0
 
@@ -179,7 +221,19 @@ class VisionEngine:
         self._recognized_emitted: set = set()
         self._recognized_names_session: set = set()
         self._unknown_emitted: set = set()
-        self._last_emotion_by_tid: dict = {}
+        # Per-person kiosk action cooldown (name → timestamp of last CLOCK_IN/OUT).
+        # Stored on the engine (not on tracks) so it survives track recycling and
+        # async recognition worker callbacks.  30 s is enough to walk away from the
+        # kiosk; the next visit after that fires a fresh action.
+        self._kiosk_last_action: Dict[str, float] = {}
+        self._KIOSK_COOLDOWN_SEC = 30.0
+        # Track IDs that have already fired a kiosk clock action in the current
+        # continuous visit.  Once a track fires CLOCK_IN or CLOCK_OUT we do NOT
+        # fire again until the track disappears (person walks away) and a brand-new
+        # track ID is assigned by ByteTrack.  This prevents the 30-second toggle
+        # loop where someone standing in front of the camera bounces between
+        # CLOCK_IN and CLOCK_OUT every 30 seconds.
+        self._kiosk_acted_track_ids: set = set()
 
         self._enrollment = {
             "collecting": False,
@@ -187,6 +241,8 @@ class VisionEngine:
             "pending": None,
             "pending_embeddings": [],
             "cooldown_until": 0.0,
+            "manual_until": 0.0,
+            "last_capture_ts": 0.0,
             "target_tid": None,
             "gap_counter": 0,
             "auto_committed": False,
@@ -198,8 +254,11 @@ class VisionEngine:
         )
 
         self._thread: Optional[threading.Thread] = None
+        self._camera_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
+        self._stopped = False
         self._running = False
+        self._camera_read_fail_streak = 0
 
         self.reset_session()
 
@@ -238,7 +297,7 @@ class VisionEngine:
             "fail_count": 0,
             "stable_count": 0,
             "last_learned_at": 0.0,
-            "last_recognition_frame": -1,
+            "last_recognition_frame": -999,
             "last_recognition_time": 0.0,
             "last_embedding": None,
             "last_distance": None,
@@ -256,6 +315,10 @@ class VisionEngine:
             "last_reject_reason": "",
             "last_best_name": "",
             "det_verified": False,
+            # Kiosk: one action (CLOCK_IN or CLOCK_OUT) per track lifetime.
+            # Cleared automatically when the track is destroyed and a new one
+            # is created on the person's next approach.
+            "kiosk_action_fired": False,
         }
 
     def _on_state_changed(self, event: StateChanged):
@@ -279,7 +342,6 @@ class VisionEngine:
         self._recognized_emitted = set()
         self._recognized_names_session = set()
         self._unknown_emitted = set()
-        self._last_emotion_by_tid = {}
         self.fsm.state = AIState.IDLE
         self.fsm.ctx = FSMContext()
         self.attention_mgr._current_primary = None
@@ -292,60 +354,276 @@ class VisionEngine:
             "pending": None,
             "pending_embeddings": [],
             "cooldown_until": 0.0,
+            "manual_until": 0.0,
+            "last_capture_ts": 0.0,
             "target_tid": None,
             "gap_counter": 0,
             "auto_committed": False,
             "provisional_name": None,
         }
+        self._kiosk_last_action.clear()
+        self._kiosk_acted_track_ids.clear()
         self.session_log.clear()
+        self.presence_tracker.reset()
+
+    def _on_presence_transition(self, transition: PresenceTransition):
+        self.session_log.append(
+            LogEntryOut(
+                ts=transition.ts,
+                type=transition.event,
+                name=transition.name,
+                detail=transition.detail,
+            )
+        )
+        # Mirror presence transitions into the attendance tracker.
+        if not self.settings.get("attendance_enabled", True):
+            return
+        # In kiosk mode, _try_fast_checkin is the sole driver of attendance records.
+        # Presence auto-CHECK_OUT fires after presence_out_timeout_seconds (default 5 s)
+        # of absence, which would call record_recognition and toggle the employee back
+        # to CLOCKED_OUT — so every subsequent walk-up becomes a CLOCK_IN instead of
+        # alternating correctly.  Block the mirror here; _try_fast_checkin handles
+        # both CLOCK_IN and CLOCK_OUT directly.
+        if self.settings.get("kiosk_fast_checkin", True):
+            return
+        name = transition.name
+        profile = self.db.get_profile(name) or {}
+        employee_id = str(profile.get("id") or name)
+        conf = float(transition.confidence or 0.0)
+        if conf <= 0.0:
+            conf = float(
+                self.settings.get(
+                    "attendance_min_confidence",
+                    self.settings.get("presence_min_lock_score", 0.75),
+                )
+            )
+        if transition.event in ("CHECK_IN", "CHECK_OUT"):
+            print(f"[attendance] {transition.event} name={name!r} conf={conf:.3f} employee_id={employee_id!r}")
+            result = self.attendance_tracker.record_recognition(
+                name=name,
+                employee_id=employee_id,
+                confidence=conf,
+            )
+            if result is None:
+                print(f"[attendance] record_recognition returned None — confidence may be below threshold ({self.attendance_tracker._min_confidence})")
+
+    def _on_attendance_alert(self, alert) -> None:
+        self.session_log.append(
+            LogEntryOut(
+                ts=alert.ts,
+                type="ALERT",
+                detail=alert.detail,
+            )
+        )
+
+    def get_attendance_tracker(self) -> AttendanceTracker:
+        return self.attendance_tracker
+
+    def get_audit_log(self) -> AuditLog:
+        return self.audit_log
+
+    def get_consent_manager(self) -> ConsentManager:
+        return self.consent_manager
+
+    def _build_presence_out(self) -> Optional[PresenceOut]:
+        if not self.settings.get("presence_enabled", True):
+            return None
+        return PresenceOut(**presence_to_api_dict(self.presence_tracker.snapshot()))
+
+    def get_presence(self) -> PresenceOut:
+        out = self._build_presence_out()
+        if out is None:
+            return PresenceOut(**presence_to_api_dict(self.presence_tracker.snapshot()))
+        return out
 
     def start(self):
         if self._running:
             return
+        self._stop.clear()
+        self._running = True
+        # Camera thread feeds the browser immediately, even while models load.
+        self._camera_thread = threading.Thread(
+            target=self._camera_loop, daemon=True, name="auty-camera"
+        )
+        self._camera_thread.start()
         if not models_ready():
             print("[Auty] Loading InsightFace (first run may download weights)…")
             rec.warmup_models()
-        self._stop.clear()
-        self._running = True
         self._thread = threading.Thread(
             target=self._loop, daemon=True, name="auty-vision"
         )
         self._thread.start()
 
     def stop(self):
+        if self._stopped:
+            return
+        self._stopped = True
         self._stop.set()
         self._running = False
+        # Release camera first so cap.read() unblocks on macOS AVFoundation.
+        try:
+            self.camera_stream.release()
+        except Exception:
+            pass
+        if self._camera_thread and self._camera_thread.is_alive():
+            self._camera_thread.join(timeout=2.0)
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=3.0)
+            self._thread.join(timeout=2.0)
         self.rec_worker.shutdown()
-        self.memory.save(force=True)
-        self.camera_stream.release()
-        cv2.destroyAllWindows()
+        try:
+            self.memory.save(force=True)
+            self.presence_tracker.flush(force=True)
+        except Exception:
+            pass
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
     def get_snapshot(self) -> FrameSnapshotOut:
         with self._lock:
             if self._latest is None:
-                return FrameSnapshotOut()
+                return FrameSnapshotOut(
+                    presence=self._build_presence_out(),
+                )
             return self._latest.payload
 
+    def recognize_client_frame(self, jpeg_bytes: bytes) -> FrameSnapshotOut:
+        """Process a JPEG sent by the client device (e.g. iPad camera).
+
+        Stateless relative to the server camera loop: runs detection +
+        recognition + attendance in the calling thread without touching the
+        track manager.  Returns a FrameSnapshotOut so the caller gets the
+        same shape of data as the WebSocket broadcast.
+        """
+        import recognition as rec
+        from vision.detector import detect as detect_faces
+        from vision.matcher import match_identity
+
+        # Decode JPEG → numpy BGR
+        buf = np.frombuffer(jpeg_bytes, np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            return self.get_snapshot()
+
+        # Resize to pipeline resolution to match enrollment embeddings
+        from vision.preprocess import preprocess_frame
+        frame = preprocess_frame(frame)
+
+        faces = detect_faces(frame, max_faces=1)
+        if not faces:
+            return self.get_snapshot()
+
+        best = faces[0]
+        x, y, w, h = best.bbox
+        aligned = rec.align_face(frame, x, y, w, h, kps=best.kps)
+        if aligned is None or aligned.size == 0:
+            return self.get_snapshot()
+
+        embedding = rec.extract_embedding(aligned)
+        if embedding is None:
+            return self.get_snapshot()
+
+        min_score = float(self.settings.get(
+            "presence_min_lock_score",
+            self.settings.get("min_lock_score", 0.62),
+        ))
+        name, score, _second, _dist = match_identity(self.db.face_db, embedding)
+        if not name or name == "UNKNOWN" or score < min_score:
+            return self.get_snapshot()
+
+        # Reuse the kiosk clock in/out logic with a synthetic track
+        now = time.time()
+        if now - self._kiosk_last_action.get(name, 0.0) < self._KIOSK_COOLDOWN_SEC:
+            return self.get_snapshot()
+
+        profile = self.db.get_profile(name) or {}
+        employee_id = str(profile.get("id") or name)
+        already_clocked_in = self.attendance_tracker.is_clocked_in(name)
+        event = self.attendance_tracker.record_recognition(
+            name=name, employee_id=employee_id, confidence=score
+        )
+        if event is not None:
+            self._kiosk_last_action[name] = now
+            presence_type = "CHECK_OUT" if already_clocked_in else "CHECK_IN"
+            print(f"[client-cam] {name!r} → {'CLOCK_OUT' if already_clocked_in else 'CLOCK_IN'}")
+            self.session_log.append(
+                LogEntryOut(ts=event.timestamp_ts, type=presence_type, name=name)
+            )
+            if already_clocked_in:
+                self.presence_tracker.force_check_out(name)
+            else:
+                self.presence_tracker.force_check_in(name, score)
+
+        return self.get_snapshot()
+
     def get_jpeg(self) -> Optional[bytes]:
+        """Live preview JPEG — updated by the camera thread, not the vision loop."""
         with self._lock:
+            if self._preview_jpeg:
+                return self._preview_jpeg
             if self._latest is None:
                 return None
-            return self._latest.jpeg
+            return self._latest.jpeg or None
 
-    def get_health(self) -> dict:
-        snap = self.get_snapshot()
+    def is_camera_ok(self) -> bool:
         with self._lock:
-            cam_ok = self._latest.camera_ok if self._latest else False
+            if self._camera_stream_ok:
+                return True
+            if self._latest is not None:
+                return bool(self._latest.camera_ok)
+            return False
+
+    def get_ws_broadcast(self) -> dict:
+        """Pre-built payload for /api/ws — must stay fast (no model_dump per tick).
+
+        Called via asyncio.to_thread so it runs in a worker thread, not on the
+        uvloop event thread.  Lock acquisition and any CPU work here is safe.
+        """
+        with self._lock:
+            cam_ok = self._camera_stream_ok or (
+                bool(self._latest.camera_ok) if self._latest else False
+            )
+            if not cam_ok:
+                return {"type": "error", "message": "Camera unavailable"}
+            if self._latest is not None:
+                return self._latest.ws_payload
+        # Camera is up but the vision thread hasn't finished its first frame yet.
+        # Return a lightweight status message so the frontend stays in loading state
+        # rather than receiving a stale FrameSnapshotOut with frame_count=0 that
+        # would cause LiveFeed to lock its lastCountRef at 0 and skip all future
+        # frame_count=0 fallback redraws.
+        return {"type": "status", "ready": True, "camera_ok": True}
+
+    def get_health_light(self) -> dict:
+        """Health for polling — avoids get_snapshot + repeated disk reads."""
+        with self._lock:
+            latest = self._latest
+            frame_count = latest.frame_count if latest else 0
+            fps = latest.fps if latest else 0.0
+            cam_ok = self._camera_stream_ok or (
+                bool(latest.camera_ok) if latest else False
+            )
         return {
             "camera_ok": cam_ok,
             "db_loaded": bool(self.db.face_db),
-            "face_db_count": len(self.db.face_db),
+            "face_count": len(self.db.face_db),
             "profile_count": len(self.db.load_profiles()),
-            "fps": round(snap.fps, 1),
+            "fps": round(fps, 1),
             "uptime_seconds": round(time.time() - self._started_at, 1),
-            "frame_count": snap.frame_count,
+            "frame_count": frame_count,
+        }
+
+    def get_health(self) -> dict:
+        h = self.get_health_light()
+        return {
+            "camera_ok": h["camera_ok"],
+            "db_loaded": h["db_loaded"],
+            "face_db_count": h["face_count"],
+            "profile_count": h["profile_count"],
+            "fps": h["fps"],
+            "uptime_seconds": h["uptime_seconds"],
+            "frame_count": h["frame_count"],
         }
 
     def _greet_stable(self) -> int:
@@ -377,6 +655,17 @@ class VisionEngine:
             return False
         return True
 
+    def _can_enroll_tick(self, track: dict) -> bool:
+        """Relaxed gate for guided enrollment capture (tick has its own quality checks)."""
+        if track.get("missing_frames", 0) > 8:
+            return False
+        bbox = track.get("smooth_bbox") or track.get("bbox", (0, 0, 0, 0))
+        min_w = float(self.settings.get("min_face_width", 50)) * 0.35
+        min_h = float(self.settings.get("min_face_height", 50)) * 0.35
+        if float(bbox[2]) < min_w or float(bbox[3]) < min_h:
+            return False
+        return True
+
     def _visible_tracks(self, tracks: Optional[List[dict]] = None) -> List[dict]:
         """Tracks safe to show in HUD / FSM / WebSocket (verified human only)."""
         src = tracks if tracks is not None else self.track_manager.active_tracks()
@@ -387,6 +676,37 @@ class VisionEngine:
             track.get("locked_name", "UNKNOWN") != "UNKNOWN"
             and track.get("stable_count", 0) >= self._greet_stable()
         )
+
+    def _presence_observations(self, tracks: List[dict]) -> Dict[str, float]:
+        if not self.settings.get("presence_enabled", True):
+            return {}
+        confirm_frames = int(self.settings.get("presence_confirm_frames", 8))
+        use_confirm = bool(
+            self.settings.get("presence_use_confirm_frames_for_filter", True)
+        )
+        min_score = float(
+            self.settings.get(
+                "presence_min_lock_score",
+                self.settings.get("min_lock_score", 0.62),
+            )
+        )
+        stable_need = confirm_frames if use_confirm else self._greet_stable()
+        obs: Dict[str, float] = {}
+        for track in tracks:
+            if not self._is_verified_human_face(track):
+                continue
+            name = track.get("locked_name", "UNKNOWN")
+            if name == "UNKNOWN":
+                continue
+            if track.get("stable_count", 0) < stable_need:
+                continue
+            if not use_confirm and not self._track_is_known_stable(track):
+                continue
+            score = float(track.get("locked_score", 0) or 0)
+            if score < min_score:
+                continue
+            obs[name] = max(obs.get(name, 0.0), score)
+        return obs
 
     def _track_is_unknown_stable(self, track: dict) -> bool:
         need = int(self.settings.get("unknown_min_stable_frames", 8))
@@ -402,6 +722,73 @@ class VisionEngine:
                 track["stable_count"] = 0
             return
         track["stable_count"] = min(track.get("stable_count", 0) + 1, 64)
+        self._try_fast_checkin(track)
+
+    def _try_fast_checkin(self, track: dict) -> None:
+        """Simple kiosk logic:
+          - Face seen, not clocked in  → CLOCK IN
+          - Face seen, already clocked in → CLOCK OUT
+        Exactly ONE action fires per visit (per unique track ID).  The person
+        must walk away (track disappears) and return (new track ID assigned by
+        ByteTrack) before the kiosk acts again.  This prevents the old 30-second
+        toggle loop where someone standing continuously in frame alternated
+        between CLOCK_IN and CLOCK_OUT every 30 seconds.
+        """
+        if not self.settings.get("kiosk_fast_checkin", True):
+            return
+        name = track.get("locked_name", "UNKNOWN")
+        if name == "UNKNOWN":
+            return
+        # Skip provisional/guest identities — they are unconfirmed auto-enrollments
+        # and should never generate payroll clock events.
+        provisional_prefix = str(self.settings.get("enrollment_provisional_prefix", "Guest"))
+        if name.startswith(provisional_prefix):
+            return
+        if track.get("stable_count", 0) < self._greet_stable():
+            return
+        score = float(track.get("locked_score") or 0.0)
+        min_score = float(self.settings.get(
+            "presence_min_lock_score",
+            self.settings.get("min_lock_score", 0.62),
+        ))
+        if score < min_score:
+            return
+
+        # One action per track ID — once a track fires we skip it until the
+        # person walks away and ByteTrack gives them a new ID on return.
+        track_id = track.get("id")
+        if track_id in self._kiosk_acted_track_ids:
+            return
+
+        # Determine and fire the action.
+        profile = self.db.get_profile(name) or {}
+        employee_id = str(profile.get("id") or name)
+        already_clocked_in = self.attendance_tracker.is_clocked_in(name)
+
+        event = self.attendance_tracker.record_recognition(
+            name=name, employee_id=employee_id, confidence=score
+        )
+        if event is None:
+            return  # below confidence threshold — don't mark track as acted
+
+        # Mark this track as having already fired so we don't toggle again
+        # while the person remains in frame.
+        if track_id is not None:
+            self._kiosk_acted_track_ids.add(track_id)
+        # Keep the legacy time-based cooldown as a cross-session backstop.
+        self._kiosk_last_action[name] = time.time()
+        action_label = "CLOCK_OUT" if already_clocked_in else "CLOCK_IN"
+        presence_type = "CHECK_OUT" if already_clocked_in else "CHECK_IN"
+        print(f"[kiosk] {name!r} → {action_label}")
+        self.session_log.append(
+            LogEntryOut(ts=event.timestamp_ts, type=presence_type, name=name)
+        )
+
+        # Keep the presence dashboard in sync (no-op if within its own cooldown).
+        if already_clocked_in:
+            self.presence_tracker.force_check_out(name)
+        else:
+            self.presence_tracker.force_check_in(name, score)
 
     def _should_run_recognition(self, track: dict) -> bool:
         fc = self._frame_count
@@ -421,12 +808,6 @@ class VisionEngine:
         if fc - track.get("last_recognition_frame", -999) < interval_locked:
             return False
         return True
-
-    def _should_run_emotion(self, track: dict) -> bool:
-        if not self._emotion_enabled or not self.emotion_analyzer.enabled:
-            return False
-        interval = self.emotion_analyzer.interval_for_track(track)
-        return self._frame_count - track.get("last_emotion_frame", -999) >= interval
 
     def _queue_event(self, event):
         event.timestamp = time.time()
@@ -450,9 +831,10 @@ class VisionEngine:
                 ts=time.time(),
                 type="UNKNOWN",
                 track_id=track_id,
-                detail="No match in database",
+                detail="Unrecognized face — no match in database",
             )
         )
+        self.attendance_tracker.record_fail(track_id)
 
     def _emit_track_lifecycle(self, active_tids: set):
         for tid in active_tids - self._prev_track_ids:
@@ -470,7 +852,8 @@ class VisionEngine:
                 k for k in self._recognized_emitted if k[0] != tid
             }
             self._unknown_emitted.discard(tid)
-            self._last_emotion_by_tid.pop(tid, None)
+            # Allow a fresh kiosk action when this person comes back (new track ID).
+            self._kiosk_acted_track_ids.discard(tid)
         self._prev_track_ids = set(active_tids)
 
     def _sync_identity_events(self, tracks: List[dict]):
@@ -607,7 +990,6 @@ class VisionEngine:
             name = t.get("locked_name", "UNKNOWN")
             score = t.get("locked_score")
             conf = float(score) if score is not None else 0.0
-            emo = t.get("user_emotion")
             out.append(
                 TrackOut(
                     id=int(t["id"]),
@@ -616,7 +998,6 @@ class VisionEngine:
                     confidence=conf,
                     known=name != "UNKNOWN",
                     stability_pct=int(t.get("stability_pct", 0)),
-                    user_emotion=str(emo) if emo else None,
                     quality_score=float(t.get("quality_score", 0)),
                     blur_score=float(t.get("blur_score", 0)),
                     vote_ratio=float(t.get("vote_ratio", 0)),
@@ -647,30 +1028,121 @@ class VisionEngine:
         )
 
     def enrollment_progress(self) -> EnrollmentProgressOut:
-        p = self.enrollment_session.progress()
-        p["auto_committed"] = bool(self._enrollment.get("auto_committed"))
-        p["provisional_name"] = self._enrollment.get("provisional_name")
-        if p["auto_committed"] and p.get("provisional_name"):
+        with self._enroll_lock:
+            p = self.enrollment_session.progress()
+            # Always expose live sample count (session dict is source of truth).
+            p["captured"] = len(self.enrollment_session.samples)
+            min_auto = int(self.settings.get("enrollment_min_auto_save", 8))
+            if self.enrollment_session.active:
+                p["active"] = True
+                p["ready_to_save"] = p["captured"] >= min_auto
+                p["percent"] = min(
+                    100.0, 100.0 * p["captured"] / max(1, min_auto)
+                )
+            p["auto_committed"] = bool(self._enrollment.get("auto_committed"))
+            p["provisional_name"] = self._enrollment.get("provisional_name")
+        if p.get("auto_committed"):
             p["ready_to_save"] = True
-            p["instruction"] = (
-                f"Recognized as {p['provisional_name']} — add a name (optional)"
-            )
+            p["captured"] = max(int(p.get("captured") or 0), min_auto)
+            p["percent"] = 100.0
+            if p.get("provisional_name"):
+                p["instruction"] = (
+                    f"Recognized as {p['provisional_name']} — add a name (optional)"
+                )
+            else:
+                p["instruction"] = "Capture complete — enter a name to save"
+        elif p.get("active") and not p.get("ready_to_save"):
+            lr = p.get("last_reject_reason")
+            if lr and (p.get("captured") or 0) < (p.get("min_auto") or 8):
+                hints = {
+                    "pose": "Face the camera directly",
+                    "blur": "Hold still — image is blurry",
+                    "quality": "Move closer or improve lighting",
+                    "lighting": "Adjust lighting on your face",
+                    "size": "Move closer to the camera",
+                    "embed": "Hold still while we capture your face",
+                }
+                p["instruction"] = hints.get(lr, f"Adjust: {lr}")
+        # After auto-commit the session is inactive so session.progress() returns
+        # preview_b64=None.  Restore it from the last captured preview so the
+        # frontend confirmation screen can show the employee's face.
+        if p.get("auto_committed") and p.get("preview_b64") is None:
+            last = self.enrollment_session.last_preview
+            if last is None:
+                # Fall back to the pending crop saved during provisional commit
+                last = self._enrollment.get("pending")
+            if last is not None:
+                try:
+                    ok, buf = cv2.imencode(
+                        ".jpg", last, [int(cv2.IMWRITE_JPEG_QUALITY), 85]
+                    )
+                    if ok:
+                        p["preview_b64"] = base64.b64encode(buf).decode("ascii")
+                except Exception:
+                    pass
         return EnrollmentProgressOut(**p)
 
     def start_guided_enrollment(self, track_id: Optional[int] = None) -> bool:
-        tracks = self.track_manager.active_tracks()
-        if not tracks:
-            return False
-        if track_id is None:
-            track = max(
-                tracks,
-                key=lambda t: (t.get("smooth_bbox") or t.get("bbox", (0, 0, 0, 0)))[2]
-                * (t.get("smooth_bbox") or t.get("bbox", (0, 0, 0, 0)))[3],
-            )
-            track_id = track["id"]
-        self.enrollment_session.start(track_id)
-        self._enrollment["collecting"] = False
+        # An auto-commit is already pending — caller can go straight to save.
+        if self._enrollment.get("auto_committed"):
+            return True
+        # Direct detection path — does not require ByteTrack/KCF tracks in frame.
+        with self._enroll_lock:
+            self.enrollment_session.start(ENROLLMENT_DIRECT_TRACK_ID)
+            self._enrollment["collecting"] = False
+            self._enrollment["manual_until"] = time.time() + 600
+            self._enrollment["last_capture_ts"] = 0.0
+        print("[Auty] Guided enrollment started (direct face detection)")
         return True
+
+    def _guided_enrollment_capture_direct(self, frame: np.ndarray) -> None:
+        """Capture samples via face detection on the live camera frame (tracker-independent)."""
+        with self._enroll_lock:
+            if not self.enrollment_session.active:
+                return
+            if self.enrollment_session.track_id != ENROLLMENT_DIRECT_TRACK_ID:
+                self.enrollment_session.track_id = ENROLLMENT_DIRECT_TRACK_ID
+
+            now = time.time()
+            if now - float(self._enrollment.get("last_capture_ts", 0)) < 0.12:
+                return
+
+            try:
+                detections = face_detection.detect_faces(
+                    frame, self.face_cascade, self.settings
+                )
+            except Exception as exc:
+                print(f"[Auty] Enrollment detect failed: {exc}")
+                return
+
+            if not detections:
+                return
+
+            det = max(
+                detections,
+                key=lambda d: float(d["bbox"][2]) * float(d["bbox"][3]),
+            )
+            bbox = det["bbox"]
+            synth = {
+                "id": ENROLLMENT_DIRECT_TRACK_ID,
+                "bbox": bbox,
+                "smooth_bbox": bbox,
+                "kps": det.get("kps"),
+                "pose_yaw": float(det.get("pose_yaw", 0)),
+                "missing_frames": 0,
+                "locked_name": "UNKNOWN",
+            }
+            accepted, reason = self.enrollment_session.tick(frame, synth)
+            if accepted:
+                n = len(self.enrollment_session.samples)
+                min_a = int(self.settings.get("enrollment_min_auto_save", 8))
+                self._enrollment["last_capture_ts"] = now
+                print(f"[Auty] Enrollment sample {n}/{min_a}")
+            elif reason and self.enrollment_session.tick_count % 20 == 0:
+                print(f"[Auty] Enrollment: {reason}")
+
+        if self.enrollment_session.active:
+            self._maybe_commit_provisional()
 
     def cancel_guided_enrollment(self):
         self.enrollment_session.cancel()
@@ -689,13 +1161,17 @@ class VisionEngine:
 
         tid = self.enrollment_session.track_id
         prefix = str(self.settings.get("enrollment_provisional_prefix", "Guest"))
-        name = f"{prefix}-{tid}"
+        # Use a timestamp-based suffix so provisional names never collide with
+        # leftover identity-store records from a previous database reset.
+        name = f"{prefix}-{int(time.time())}"
 
         crops = self.enrollment_session.all_crops()
         image_rel = None
         if crops:
             safe = _sanitize_name(name)
-            image_rel = os.path.join(db_mod.CAPTURE_FOLDER, f"{safe}.jpg")
+            # Unique suffix prevents a second enrollment from overwriting the
+            # photo file of a different person who happened to get the same name.
+            image_rel = os.path.join(db_mod.CAPTURE_FOLDER, f"{safe}_{int(time.time())}.jpg")
             cv2.imwrite(image_rel, crops[-1])
 
         profile = {
@@ -750,6 +1226,7 @@ class VisionEngine:
         self.session_log.append(
             LogEntryOut(ts=time.time(), type="ENROLLED", name=name)
         )
+        self.audit_log.log("enrollment", actor="system", detail=f"Auto-enrolled {name}")
         return True, name
 
     def _maybe_commit_provisional(self) -> None:
@@ -768,6 +1245,41 @@ class VisionEngine:
         bbox = track.get("smooth_bbox") or track.get("bbox", (0, 0, 0, 0))
         return float(bbox[2] * bbox[3])
 
+    def _tracks_for_enrollment(self) -> List[dict]:
+        """Live tracker faces only — never snapshot IDs (they don't match vision loop)."""
+        max_miss = int(self.settings.get("max_missing_frames", 15))
+        candidates: List[dict] = []
+        for t in self.track_manager.tracks.values():
+            if t.get("state") == track_engine.TrackState.REMOVED:
+                continue
+            if t.get("missing_frames", 0) > max_miss:
+                continue
+            bbox = t.get("smooth_bbox") or t.get("bbox")
+            if not bbox or float(bbox[2]) * float(bbox[3]) < 100:
+                continue
+            candidates.append(t)
+        return candidates
+
+    def _enrollment_track_for_frame(
+        self, tracks_by_id: Dict[int, dict]
+    ) -> Optional[dict]:
+        """Resolve which track to sample — follows face if the locked id drifts."""
+        if not self.enrollment_session.active:
+            return None
+        etid = self.enrollment_session.track_id
+        track = tracks_by_id.get(etid) if etid is not None else None
+        if track is not None and track.get("missing_frames", 0) <= 5:
+            if self._can_enroll_tick(track):
+                return track
+        candidates = [
+            t for t in tracks_by_id.values() if self._can_enroll_tick(t)
+        ]
+        if not candidates:
+            return None
+        best = max(candidates, key=self._track_area)
+        self.enrollment_session.track_id = best["id"]
+        return best
+
     def _maybe_auto_start_enrollment(self, tracks: List[dict]) -> None:
         """Start guided capture when an unknown face is stable — no button press."""
         if not self._guided_enroll:
@@ -781,6 +1293,8 @@ class VisionEngine:
         if self._enrollment.get("pending") is not None:
             return
         if time.time() < self._enrollment.get("cooldown_until", 0.0):
+            return
+        if time.time() < self._enrollment.get("manual_until", 0.0):
             return
 
         enroll_stable = int(self.settings.get("enrollment_min_stable_frames", 10))
@@ -799,17 +1313,58 @@ class VisionEngine:
         self._enrollment["collecting"] = False
         print(f"[Auty] Auto-started enrollment on track T{track['id']}")
 
-    def _process_one_frame(self) -> Tuple[bool, Optional[np.ndarray]]:
-        ret, frame = self.camera_stream.read()
-        if not ret:
-            return False, None
+    def _camera_loop(self):
+        """Dedicated capture loop — keeps /api/frame.jpg live while vision runs slowly on CPU."""
+        while not self._stop.is_set():
+            ret, frame = self.camera_stream.read()
+            if ret and frame is not None:
+                ok, buf = cv2.imencode(
+                    ".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75]
+                )
+                if ok:
+                    with self._lock:
+                        self._preview_jpeg = buf.tobytes()
+                        self._camera_stream_ok = True
+                self._camera_read_fail_streak = 0
+                frame_copy = frame.copy()
+                self._camera_frame_idx += 1
+                if (
+                    self._guided_enroll
+                    and self.enrollment_session.active
+                    and self.enrollment_session.track_id == ENROLLMENT_DIRECT_TRACK_ID
+                    and self._camera_frame_idx % 4 == 0
+                ):
+                    self._guided_enrollment_capture_direct(frame_copy)
+                try:
+                    self._frame_queue.put_nowait(frame_copy)
+                except queue.Full:
+                    try:
+                        self._frame_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        self._frame_queue.put_nowait(frame_copy)
+                    except queue.Full:
+                        pass
+            else:
+                self._camera_read_fail_streak += 1
+                if self._camera_read_fail_streak >= 8:
+                    with self._lock:
+                        self._camera_stream_ok = False
+            if self._stop.wait(0.033):
+                break
 
+    def _process_frame_data(self, frame: np.ndarray) -> bool:
         frame = preprocess_frame(frame)
         self.track_manager.step(frame, self._frame_count)
         active_tids: set = set()
         unknown_faces = []
         profiles = self.db.load_profiles()
-        tracks_by_id = {t["id"]: t for t in self.track_manager.active_tracks()}
+        tracks_by_id = {
+            t["id"]: t
+            for t in self.track_manager.tracks.values()
+            if t.get("state") != track_engine.TrackState.REMOVED
+        }
 
         for tid, embedding in self.rec_worker.poll():
             self._apply_async(tid, embedding, tracks_by_id)
@@ -828,19 +1383,11 @@ class VisionEngine:
             if track.get("locked_name", "UNKNOWN") == "UNKNOWN" and not fq.passed:
                 track["stable_count"] = 0
 
-            if (
-                self.enrollment_session.active
-                and tid == self.enrollment_session.track_id
-                and self._is_verified_human_face(track)
-            ):
-                self.enrollment_session.tick(frame, track)
-
             need_rec = (
                 bool(self.db.face_db)
                 and self._should_run_recognition(track)
                 and fq.passed
             )
-            need_emo = self._should_run_emotion(track)
             enrolling_tid = self.enrollment_session.track_id
             need_enroll_align = (
                 self._guided_enroll
@@ -853,7 +1400,7 @@ class VisionEngine:
                 and fq.passed
             )
             aligned = None
-            if need_rec or need_emo or need_enroll_align:
+            if need_rec or need_enroll_align:
                 aligned = rec.align_face(frame, x, y, w, h, kps=track.get("kps"))
             elif self._track_is_known_stable(track):
                 track["miss_count"] = 0
@@ -887,35 +1434,19 @@ class VisionEngine:
             ):
                 unknown_faces.append((w * h, tid, aligned.copy()))
 
-            if need_emo and aligned is not None and aligned.size != 0:
-                prev = track.get("user_emotion")
-                self.emotion_analyzer.maybe_update(track, aligned, self._frame_count)
-                if track.get("user_emotion") != prev:
-                    emo = track.get("user_emotion")
-                    if emo:
-                        pct = int(track.get("user_emotion_pct", 0))
-                        tid_e = track["id"]
-                        if self._last_emotion_by_tid.get(tid_e) != (emo, pct):
-                            self._last_emotion_by_tid[tid_e] = (emo, pct)
-                            self._queue_event(
-                                EmotionUpdated(
-                                    track_id=tid_e,
-                                    emotion=emo,
-                                    confidence_pct=pct,
-                                )
-                            )
-
         tracks = self.track_manager.active_tracks()
         visible = self._visible_tracks(tracks)
+
         if self.enrollment_session.active:
-            etid = self.enrollment_session.track_id
-            enroll_track = tracks_by_id.get(etid)
-            if enroll_track is None or not self._is_verified_human_face(
-                enroll_track
-            ):
-                self.cancel_guided_enrollment()
-                self._enrollment["cooldown_until"] = time.time() + ENROLL_COOLDOWN_SEC
-        self._maybe_commit_provisional()
+            if self.enrollment_session.track_id != ENROLLMENT_DIRECT_TRACK_ID:
+                tick_track = self._enrollment_track_for_frame(tracks_by_id)
+                if tick_track is not None:
+                    with self._enroll_lock:
+                        accepted, _ = self.enrollment_session.tick(frame, tick_track)
+                        if accepted:
+                            n = len(self.enrollment_session.samples)
+                            print(f"[Auty] Enrollment sample {n}")
+                    self._maybe_commit_provisional()
         self._maybe_auto_start_enrollment(visible)
         visible_ids = {t["id"] for t in visible}
         self._emit_track_lifecycle(visible_ids)
@@ -939,6 +1470,9 @@ class VisionEngine:
         )
         self._sync_identity_events(visible)
 
+        if self.settings.get("presence_enabled", True):
+            self.presence_tracker.update(self._presence_observations(visible))
+
         if attn.primary_track_id != prev_primary:
             self._queue_event(
                 AttentionShifted(
@@ -952,6 +1486,7 @@ class VisionEngine:
 
         frame, ctx = self.response_engine.process_frame(frame, primary_track)
         self.memory.save()
+        self.presence_tracker.flush()
 
         if self.settings.get("hud_enabled", True):
             frame = self.hud_renderer.draw_all(
@@ -983,45 +1518,49 @@ class VisionEngine:
             log_tail=self.session_log.list_all()[-20:],
             enrollment=self._enrollment_out(),
             enrollment_progress=self.enrollment_progress(),
+            presence=self._build_presence_out(),
+            recent_attendance=[
+                AttendanceEventOut(**ev.to_dict())
+                for ev in self.attendance_tracker.get_recent_events(5)
+            ],
             frame_width=PROCESS_W,
             frame_height=PROCESS_H,
         )
 
         ok, jpeg = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         jpeg_bytes = jpeg.tobytes() if ok else b""
+        ws_payload = payload.model_dump()
 
         with self._lock:
+            preview = self._preview_jpeg
             self._latest = _FrameSnapshot(
                 frame_count=self._frame_count,
                 fps=self._fps_ema,
-                jpeg=jpeg_bytes,
+                jpeg=jpeg_bytes if jpeg_bytes else preview,
                 payload=payload,
+                ws_payload=ws_payload,
                 camera_ok=True,
             )
-        return True, frame
+        return True
 
     def _loop(self):
         while not self._stop.is_set():
+            try:
+                frame = self._frame_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
             t0 = time.perf_counter()
-            ok, _ = self._process_one_frame()
+            try:
+                self._process_frame_data(frame)
+            except Exception as exc:
+                print(f"[Auty] Vision frame error: {exc}")
+                continue
             elapsed = time.perf_counter() - t0
             if elapsed > 0:
                 inst_fps = 1.0 / elapsed
                 self._fps_ema = inst_fps if self._fps_ema <= 0 else (
                     0.85 * self._fps_ema + 0.15 * inst_fps
                 )
-            if not ok:
-                with self._lock:
-                    self._latest = _FrameSnapshot(
-                        frame_count=self._frame_count,
-                        fps=0.0,
-                        jpeg=b"",
-                        payload=FrameSnapshotOut(),
-                        camera_ok=False,
-                    )
-            delay = max(0.001, 0.033 - elapsed)
-            if self._stop.wait(delay):
-                break
 
     def _refresh_tracks_after_enroll(self, name: str):
         """Force active tracks to re-run recognition against the new embeddings."""
@@ -1063,6 +1602,8 @@ class VisionEngine:
         status: str,
         *,
         image_b64: Optional[str] = None,
+        extra_images: Optional[List[str]] = None,
+        allow_low_confidence: bool = False,
     ) -> Tuple[bool, str]:
         enr = self._enrollment
         name = name.strip()
@@ -1093,6 +1634,9 @@ class VisionEngine:
         if provisional and name.strip().lower() != str(provisional).strip().lower():
             if not self.db.rename_profile(provisional, name):
                 return False, f"Could not rename {provisional} to {name}"
+            from vision.matcher import sync_gallery
+
+            sync_gallery(self.db.face_db, self.db.store)
             enr["provisional_name"] = name
             self._refresh_tracks_after_enroll(name)
             track = self.track_manager.get_track(enr.get("target_tid"))
@@ -1135,7 +1679,7 @@ class VisionEngine:
             return False, "No face ready to enroll — wait for the snapshot, then save"
 
         safe = _sanitize_name(name)
-        image_rel = os.path.join(db_mod.CAPTURE_FOLDER, f"{safe}.jpg")
+        image_rel = os.path.join(db_mod.CAPTURE_FOLDER, f"{safe}_{int(time.time())}.jpg")
         cv2.imwrite(image_rel, pending_bgr)
 
         profile = {
@@ -1172,14 +1716,41 @@ class VisionEngine:
                 )
             profile["id"] = rec_meta.id
             self.db.save_profile(name, profile)
+
+            # Process additional images (device-camera 3-photo flow).
+            if extra_images:
+                for img_b64_extra in extra_images:
+                    try:
+                        ep = img_b64_extra.strip()
+                        if "," in ep and ep.startswith("data:"):
+                            ep = ep.split(",", 1)[1]
+                        raw_e = base64.b64decode(ep)
+                        arr_e = np.frombuffer(raw_e, dtype=np.uint8)
+                        decoded_e = cv2.imdecode(arr_e, cv2.IMREAD_COLOR)
+                        if decoded_e is not None and decoded_e.size > 0:
+                            extra_embs = rec.extract_embeddings_robust(decoded_e)
+                            for emb in extra_embs:
+                                self.db.add_embedding(name, emb)
+                    except Exception:
+                        pass  # Best-effort; don't fail enrolment for extra images
+
             self.db.face_db = self.db.store.build_face_db()
             self.db.save()
+            from vision.matcher import sync_gallery
+
+            sync_gallery(self.db.face_db, self.db.store)
             self.response_engine.on_profile_saved(name)
             n_samples = len(self.db.face_db.get(name, []))
             if n_samples == 0:
                 return (
                     False,
                     "Could not generate embedding — check lighting and face the camera",
+                )
+            if extra_images and n_samples < 3 and not allow_low_confidence:
+                confidence = round(min(n_samples / 3.0, 1.0), 2)
+                return (
+                    False,
+                    f"LOW_CONFIDENCE:{confidence}",
                 )
             print(f"[Auty] Enrolled {name} ({n_samples} embedding(s) in database)")
         except Exception as exc:
@@ -1202,6 +1773,7 @@ class VisionEngine:
         self.session_log.append(
             LogEntryOut(ts=time.time(), type="ENROLLED", name=name)
         )
+        self.audit_log.log("enrollment", actor="manager", detail=f"Enrolled {name}")
         return True, name
 
 

@@ -24,6 +24,12 @@ PROFILES_PATH = DATA_DIR / "profiles.json"
 MEMORY_PATH = DATA_DIR / "memory.json"
 CAPTURES_DIR = DATA_DIR / "captures"
 LOG_PATH = DATA_DIR / "logs.txt"
+PRESENCE_SESSIONS_PATH = DATA_DIR / "presence_sessions.json"
+ATTENDANCE_LOG_PATH = DATA_DIR / "attendance_log.jsonl"
+ATTENDANCE_NOTES_PATH = DATA_DIR / "attendance_notes.json"
+SCHEDULES_PATH = DATA_DIR / "schedules.json"
+CONSENT_LOG_PATH = DATA_DIR / "consent_log.json"
+AUDIT_LOG_PATH = DATA_DIR / "audit_log.jsonl"
 
 _LEGACY_ROOT_FILES = (
     ("face_db.pkl", FACE_DB_PATH),

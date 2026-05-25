@@ -1,6 +1,7 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef } from "react";
 import type { FrameSnapshot } from "../../types";
 import { frameUrl } from "../../services/api";
+import { useFrameJpeg } from "../../hooks/useFrameJpeg";
 
 interface Props {
   frame: FrameSnapshot | null;
@@ -39,27 +40,11 @@ function drawTracks(
   }
 }
 
-/** ~20 FPS — MJPEG in <img> is broken in Chrome/Safari; poll JPEG instead. */
-const FRAME_MS = 50;
-
 function LiveFeedInner({ frame }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wrapRef = useRef<HTMLDivElement>(null);
   const lastCountRef = useRef(-1);
-  const [imgSrc, setImgSrc] = useState(() => frameUrl());
-
-  useEffect(() => {
-    let active = true;
-    const tick = () => {
-      if (active) setImgSrc(frameUrl());
-    };
-    tick();
-    const id = window.setInterval(tick, FRAME_MS);
-    return () => {
-      active = false;
-      window.clearInterval(id);
-    };
-  }, []);
+  const imgSrc = useFrameJpeg();
 
   useEffect(() => {
     if (!frame || frame.frame_count === lastCountRef.current) return;
@@ -88,6 +73,9 @@ function LiveFeedInner({ frame }: Props) {
         alt="Live camera"
         className="h-full w-full object-contain"
         draggable={false}
+        onError={(e) => {
+          (e.target as HTMLImageElement).src = frameUrl();
+        }}
       />
       <canvas
         ref={canvasRef}

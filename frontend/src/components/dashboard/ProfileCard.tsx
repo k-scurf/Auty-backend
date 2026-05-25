@@ -7,10 +7,9 @@ import { profilePhotoUrl } from "../../services/api";
 interface Props {
   track: Track | null;
   statusLine: string;
-  showEmotion: boolean;
 }
 
-export function ProfileCard({ track, statusLine, showEmotion }: Props) {
+export function ProfileCard({ track, statusLine }: Props) {
   if (!track) {
     return (
       <GlassCard className="flex flex-col gap-3">
@@ -34,7 +33,7 @@ export function ProfileCard({ track, statusLine, showEmotion }: Props) {
       <div className="flex items-start justify-between gap-2">
         <div>
           <h2 className="text-lg font-semibold text-slate-100">
-            {known ? track.name : "Unknown visitor"}
+            {known ? track.name : "Unrecognized face"}
           </h2>
           <p className="text-xs text-slate-400">{statusLine}</p>
         </div>
@@ -76,12 +75,7 @@ export function ProfileCard({ track, statusLine, showEmotion }: Props) {
         </div>
       )}
 
-      <p className="text-xs text-slate-500">
-        Stability {track.stability_pct}%
-        {showEmotion && track.user_emotion
-          ? ` · ${track.user_emotion}`
-          : ""}
-      </p>
+      <p className="text-xs text-slate-500">Stability {track.stability_pct}%</p>
     </GlassCard>
   );
 }

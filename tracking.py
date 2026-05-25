@@ -389,6 +389,9 @@ class FaceTrackManager:
 
         if run_detect:
             detections = self._run_detection(frame)
+            if self._cfg("debug_scores", False) or frame_count % 60 == 0:
+                scores = [round(float(d.get("score", 0)), 3) if isinstance(d, dict) else 0.9 for d in detections]
+                print(f"[detect] frame={frame_count} found={len(detections)} scores={scores} tracks={len(self.tracks)}")
             xyxy = []
             det_by_idx = []
             for det in detections:

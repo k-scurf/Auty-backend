@@ -10,10 +10,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from behavior_sequence_engine import BehaviorSequenceEngine, SequenceStep
-from emotion_system import mood_for_identity, theme_for_mood
 from event_system import (
     AttentionShifted,
-    EmotionUpdated,
     Event,
     EventBus,
     FaceDetected,
@@ -29,6 +27,7 @@ from personality_engine import Mood, PersonalityEngine
 from personality_rules import PersonalityRules
 from response_throttler import ResponseThrottler
 from state_machine import AIState, StateMachine
+from ui.theme import HUD_KNOWN, HUD_UNKNOWN
 from ui_effects import UIEffects
 from voice_system import VoiceSystem
 
@@ -48,10 +47,10 @@ class LlmResponseHandler:
             self._checked = True
         return self._available
 
-    def respond(self, prompt: str, name: str, mood: str, memory_line: str, user_emotion: str = "") -> str:
+    def respond(self, prompt: str, name: str, mood: str, memory_line: str) -> str:
         if not self.available():
             return ""
-        return self.llm.reply(prompt, name, mood, memory_line, user_emotion=user_emotion) or ""
+        return self.llm.reply(prompt, name, mood, memory_line) or ""
 
 
 @dataclass
@@ -82,7 +81,6 @@ class ResponseContext:
     ui_motion: str = "minimal"
     track_themes: Dict[int, dict] = field(default_factory=dict)
     memory_lines: Dict[int, str] = field(default_factory=dict)
-    user_feelings: Dict[int, str] = field(default_factory=dict)
 
 
 class ResponseEngine:
@@ -213,33 +211,26 @@ class ResponseEngine:
         tier = self.memory.get_relationship_tier(name, self._profiles) if stable else "UNKNOWN"
 
         self._ctx.state = self.fsm.state.value
-        self._ctx.mood = mood_for_identity(
-            name if stable else "UNKNOWN",
-            tier if stable else "UNKNOWN",
-            len(self._tracks) > 0,
-            state_enum,
-        )
+        if stable and tier == "OWNER":
+            self._ctx.mood = Mood.FRIENDLY
+        elif state_enum == AIState.ALERT:
+            self._ctx.mood = Mood.ALERT
+        elif name == "UNKNOWN" and self._tracks:
+            self._ctx.mood = Mood.SUSPICIOUS
+        else:
+            self._ctx.mood = Mood.CALM
 
         themes = {}
         mem_lines = {}
-        feelings = {}
         for t in self._tracks:
             tid = t["id"]
             tname = t.get("locked_name", "UNKNOWN")
             tstable = tname != "UNKNOWN" and t.get("stable_count", 0) >= 2
-            ttier = self.memory.get_relationship_tier(tname, self._profiles) if tstable else "UNKNOWN"
-            tmood = mood_for_identity(tname, ttier, True, state_enum)
-            themes[tid] = theme_for_mood(tmood, known=tname != "UNKNOWN")
+            themes[tid] = HUD_KNOWN if tname != "UNKNOWN" else HUD_UNKNOWN
             mem_lines[tid] = self.memory.get_visit_summary(tname) if tstable else ""
-            feelings[tid] = (
-                self._feeling_label(t)
-                if self.settings.get("user_emotion_enabled", False)
-                else "—"
-            )
 
         self._ctx.track_themes = themes
         self._ctx.memory_lines = mem_lines
-        self._ctx.user_feelings = feelings
         self._ctx.last_spoken = self.voice.last_spoken or self.llm.last_reply or self._ctx.last_spoken
 
     def _on_event(self, event: Event):
@@ -247,8 +238,6 @@ class ResponseEngine:
             self._handle_face_recognized(event)
         elif isinstance(event, UnknownFaceDetected):
             self._handle_unknown(event)
-        elif isinstance(event, EmotionUpdated):
-            self._handle_emotion(event)
         elif isinstance(event, StateChanged):
             self._handle_state_changed(event)
         elif isinstance(event, InteractionStarted):
@@ -386,13 +375,6 @@ class ResponseEngine:
     def _handle_unknown(self, event: UnknownFaceDetected):
         pass  # FSM + themes handle alert styling
 
-    def _handle_emotion(self, event: EmotionUpdated):
-        for t in self._tracks:
-            if t["id"] == event.track_id:
-                t["user_emotion"] = event.emotion
-                t["user_emotion_pct"] = event.confidence_pct
-                break
-
     def _handle_state_changed(self, event: StateChanged):
         self.throttler.on_state_changed(event.new_state)
         self._ctx.state = event.new_state
@@ -420,14 +402,9 @@ class ResponseEngine:
         if not self._ollama_ok:
             return
         self._conversed_session.add(name)
-        feeling = ""
-        for t in self._tracks:
-            if t.get("locked_name") == name:
-                feeling = self._feeling_label(t)
-                break
-        self._start_llm_async(name, memory_line, feeling)
+        self._start_llm_async(name, memory_line)
 
-    def _start_llm_async(self, name: str, memory_line: str, user_feeling: str):
+    def _start_llm_async(self, name: str, memory_line: str):
         self._llm_busy = True
         mood = self._ctx.mood.value
         state_val = self._ctx.state
@@ -439,7 +416,6 @@ class ResponseEngine:
                     name,
                     mood,
                     memory_line,
-                    user_emotion=user_feeling,
                 )
                 if reply:
                     if self.settings.get("voice_enabled", False):
@@ -455,19 +431,6 @@ class ResponseEngine:
         profiles = self.memory.load_profiles()
         self.memory.ensure_person(name, profiles)
         self.memory.record_event(name, "enrolled", Mood.FRIENDLY.value, profiles)
-
-    @staticmethod
-    def _feeling_label(track: dict) -> str:
-        from user_emotion import EMOTION_LABELS
-
-        raw = track.get("user_emotion")
-        if not raw:
-            return "—"
-        label = EMOTION_LABELS.get(raw, str(raw).title())
-        pct = track.get("user_emotion_pct")
-        if pct is not None:
-            return f"{label} ({pct}%)"
-        return label
 
     # Voice command handler expects .voice on brain
     def _pick_primary(self, tracks: List[dict]):

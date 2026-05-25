@@ -33,13 +33,17 @@ def align_from_landmarks(bgr: np.ndarray, kps: np.ndarray) -> np.ndarray:
 def align_crop(frame: np.ndarray, x: int, y: int, w: int, h: int, kps: np.ndarray | None) -> np.ndarray:
     from vision.preprocess import padded_crop
 
+    pad_x = int(w * 0.30)
+    pad_y = int(h * 0.30)
+    x1 = max(x - pad_x, 0)
+    y1 = max(y - pad_y, 0)
     crop = padded_crop(frame, x, y, w, h)
     if crop.size == 0:
         return crop
     if kps is not None and len(kps) >= 5:
         local = np.asarray(kps, dtype=np.float32).copy()
-        local[:, 0] -= x
-        local[:, 1] -= y
+        local[:, 0] -= x1
+        local[:, 1] -= y1
         return align_from_landmarks(crop, local)
     return crop
 

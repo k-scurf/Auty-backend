@@ -53,22 +53,37 @@ class RecognitionWorker:
         return out
 
     def shutdown(self):
+        if self._stop.is_set():
+            return
         self._stop.set()
         try:
             self._jobs.put_nowait(None)
         except queue.Full:
-            pass
+            try:
+                self._jobs.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._jobs.put_nowait(None)
+            except queue.Full:
+                pass
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
 
     def _loop(self):
         while not self._stop.is_set():
-            job = self._jobs.get()
-            if job is None:
+            try:
+                job = self._jobs.get(timeout=0.25)
+            except queue.Empty:
                 continue
+            if job is None:
+                break
             track_id, aligned = job
             try:
                 embedding = rec.extract_embedding(
                     aligned, already_aligned=rec.is_aligned_crop(aligned)
                 )
-            except Exception:
+            except Exception as e:
+                print(f"[worker] T{track_id} embedding error: {e}")
                 embedding = None
             self._results.put((track_id, embedding))
