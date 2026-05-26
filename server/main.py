@@ -40,6 +40,8 @@ from server.schemas import (
     FrameCheckRequest,
     FrameSnapshotOut,
     HealthOut,
+    LoginRequest,
+    LoginResponse,
     PresenceOut,
     ProfileCreate,
     ProfileOut,
@@ -73,7 +75,8 @@ _vision_boot_started = False
 _vision_boot_lock = threading.Lock()
 _ws_interval = 1.0 / 12.0
 
-_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_DEFAULT_DIST = Path(__file__).resolve().parent.parent / "frontend" / "dist"
+_DIST = Path(os.environ.get("AUTY_FRONTEND_DIST", str(_DEFAULT_DIST))).expanduser().resolve()
 _INDEX = _DIST / "index.html"
 _ASSETS = _DIST / "assets"
 
@@ -129,7 +132,7 @@ async def lifespan(app: FastAPI):
     if _ui_built():
         _INDEX_BYTES = _INDEX.read_bytes()
         url = "http://127.0.0.1:8000"
-        print(f"[Auty] Dashboard: {url}  (frontend/dist loaded)")
+        print(f"[Auty] Dashboard: {url}  ({_DIST} loaded)")
         print("[Auty] Live camera feed is in the browser — no separate preview window.")
         if os.environ.get("AUTY_NO_BROWSER", "").lower() not in ("1", "true", "yes"):
 
@@ -142,7 +145,7 @@ async def lifespan(app: FastAPI):
 
             threading.Thread(target=_open_browser, daemon=True).start()
     else:
-        print("[Auty] API only — build frontend/dist then restart, or run ./scripts/dev-frontend.sh")
+        print(f"[Auty] API only — frontend dist not found at {_DIST}")
         print("[Auty] Then open http://127.0.0.1:8000 — or run: cd frontend && npm run dev")
     _boot_vision_engine()
     yield
@@ -180,6 +183,31 @@ def require_engine() -> VisionEngine:
 
 def vision_ref() -> Optional[VisionEngine]:
     return _vision
+
+
+@app.post("/api/auth/login", response_model=LoginResponse)
+def login(body: LoginRequest):
+    settings = load_settings()
+    expected_username = str(
+        os.environ.get("AUTY_MANAGER_USERNAME")
+        or settings.get("manager_username")
+        or "owner"
+    )
+    expected_password = str(
+        os.environ.get("AUTY_MANAGER_PASSWORD")
+        or settings.get("manager_password")
+        or settings.get("kiosk_pin")
+        or "1234"
+    )
+
+    if body.username.strip() != expected_username or body.password != expected_password:
+        raise HTTPException(status_code=401, detail="Incorrect username or password")
+
+    expires_at_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=12)
+    expires_at = expires_at_dt.isoformat().replace("+00:00", "Z")
+    nonce = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
+    token = f"local_{expected_username}_{nonce}"
+    return LoginResponse(token=token, expires_at=expires_at)
 
 
 @app.get("/api/health", response_model=HealthOut)

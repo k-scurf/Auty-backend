@@ -92,6 +92,16 @@ class AttendanceNoteCreate(BaseModel):
     manager: str = "manager"
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    token: str
+    expires_at: str
+
+
 class ExportRequest(BaseModel):
     format: str  # gusto | adp | square
     start_date: str  # YYYY-MM-DD
