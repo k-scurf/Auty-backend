@@ -216,6 +216,16 @@ def load_settings() -> dict:
     merged["attendance_notes_path"] = str(ATTENDANCE_NOTES_PATH)
     merged["consent_log_path"] = str(CONSENT_LOG_PATH)
     merged["audit_log_path"] = str(AUDIT_LOG_PATH)
-    if os.environ.get("AUTY_INSIGHTFACE_PACK"):
-        merged["insightface_pack"] = os.environ["AUTY_INSIGHTFACE_PACK"]
+    pack_env = os.environ.get("AUTY_INSIGHTFACE_PACK")
+    if pack_env:
+        merged["insightface_pack"] = pack_env
+    elif os.environ.get("RAILWAY_ENVIRONMENT"):
+        # buffalo_l needs ~2GB+ RAM; buffalo_sc fits typical Railway plans.
+        merged["insightface_pack"] = "buffalo_sc"
+        merged["insightface_det_size"] = int(
+            os.environ.get("AUTY_INSIGHTFACE_DET_SIZE") or 320
+        )
+    det_env = os.environ.get("AUTY_INSIGHTFACE_DET_SIZE")
+    if det_env:
+        merged["insightface_det_size"] = int(det_env)
     return merged

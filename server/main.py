@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from camera import local_camera_enabled
 from server.auty_engine import VisionEngine, get_engine
 from server.schemas import (
     AttendanceEventOut,
@@ -101,6 +102,16 @@ def _ui_built() -> bool:
     return _INDEX.is_file()
 
 
+def _defer_vision_boot() -> bool:
+    if os.environ.get("AUTY_DEFER_VISION_BOOT", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    ):
+        return True
+    return bool(os.environ.get("RAILWAY_ENVIRONMENT"))
+
+
 def _boot_vision_engine():
     """Load InsightFace and camera in a background thread so HTTP/WS accept immediately."""
     global _vision, _vision_boot_started
@@ -153,7 +164,13 @@ async def lifespan(app: FastAPI):
             )
         else:
             print("[Auty] Then open http://127.0.0.1:8000 — or run: cd frontend && npm run dev")
-    _boot_vision_engine()
+    if _defer_vision_boot():
+        print(
+            "[Auty] Vision engine deferred — loads on first API use "
+            "(buffalo_sc on Railway to limit memory)."
+        )
+    else:
+        _boot_vision_engine()
     yield
     if _vision is not None:
         print("[Auty] Shutting down vision engine…")
@@ -184,9 +201,10 @@ app.add_middleware(
 
 
 def require_engine() -> VisionEngine:
-    if vision_ref() is None:
-        raise HTTPException(status_code=503, detail="Vision engine not started")
-    return vision_ref()
+    global _vision
+    if _vision is None:
+        _vision = get_engine()
+    return _vision
 
 
 def vision_ref() -> Optional[VisionEngine]:
@@ -218,14 +236,31 @@ def login(body: LoginRequest):
     return LoginResponse(token=token, expires_at=expires_at)
 
 
+@app.get("/api/health/live")
+def health_live():
+    """Lightweight probe for Railway/load balancers — never loads models."""
+    return {"ok": True, "vision_loaded": vision_ref() is not None}
+
+
 @app.get("/api/health", response_model=HealthOut)
 def health():
-    eng = require_engine()
+    eng = vision_ref()
+    if eng is None:
+        return HealthOut(
+            camera_ok=True,
+            db_loaded=False,
+            face_count=0,
+            profile_count=0,
+            fps=0.0,
+            uptime_seconds=0.0,
+            frame_count=0,
+        )
     h = eng.get_health()
-    if not h["camera_ok"]:
+    if not h["camera_ok"] and local_camera_enabled(eng.settings):
         raise HTTPException(status_code=503, detail="Camera unavailable")
+    camera_ok = h["camera_ok"] or not local_camera_enabled(eng.settings)
     return HealthOut(
-        camera_ok=h["camera_ok"],
+        camera_ok=camera_ok,
         db_loaded=h["db_loaded"],
         face_count=h["face_db_count"],
         profile_count=h["profile_count"],
