@@ -146,7 +146,13 @@ async def lifespan(app: FastAPI):
             threading.Thread(target=_open_browser, daemon=True).start()
     else:
         print(f"[Auty] API only — frontend dist not found at {_DIST}")
-        print("[Auty] Then open http://127.0.0.1:8000 — or run: cd frontend && npm run dev")
+        if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("AUTY_HEADLESS"):
+            print(
+                "[Auty] Cloud deploy: serve the dashboard from Vercel; "
+                "this service is API-only (no server webcam)."
+            )
+        else:
+            print("[Auty] Then open http://127.0.0.1:8000 — or run: cd frontend && npm run dev")
     _boot_vision_engine()
     yield
     if _vision is not None:

@@ -162,6 +162,7 @@ class VisionEngine:
         self.camera_stream = camera_mod.CameraStream(
             self.settings, PROCESS_W, PROCESS_H
         )
+        self._use_local_camera = self.camera_stream.enabled
         self.face_cascade = face_detection.create_haar_cascade()
         self.track_manager = track_engine.FaceTrackManager(
             self.settings,
@@ -441,11 +442,13 @@ class VisionEngine:
             return
         self._stop.clear()
         self._running = True
-        # Camera thread feeds the browser immediately, even while models load.
-        self._camera_thread = threading.Thread(
-            target=self._camera_loop, daemon=True, name="auty-camera"
-        )
-        self._camera_thread.start()
+        self._camera_thread = None
+        if self._use_local_camera:
+            # Camera thread feeds the browser immediately, even while models load.
+            self._camera_thread = threading.Thread(
+                target=self._camera_loop, daemon=True, name="auty-camera"
+            )
+            self._camera_thread.start()
         if not models_ready():
             print("[Auty] Loading InsightFace (first run may download weights)…")
             rec.warmup_models()

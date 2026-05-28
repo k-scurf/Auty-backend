@@ -2,10 +2,32 @@
 Video capture — read, flip, and resize to processing resolution.
 """
 
+import glob
 import os
 import sys
 
 import cv2
+
+
+def local_camera_enabled(settings: dict) -> bool:
+    """True when this machine should open a USB/system camera (not cloud/API-only)."""
+    env = os.environ.get("AUTY_USE_LOCAL_CAMERA", "").strip().lower()
+    if env in ("0", "false", "no", "off"):
+        return False
+    if env in ("1", "true", "yes", "on"):
+        return True
+    if os.environ.get("AUTY_HEADLESS", "").strip().lower() in ("1", "true", "yes"):
+        return False
+    if os.environ.get("RAILWAY_ENVIRONMENT"):
+        return False
+    if settings.get("use_local_camera") is False:
+        return False
+    idx = settings.get("camera_index")
+    if idx is None or (isinstance(idx, (int, float)) and int(idx) < 0):
+        return False
+    if sys.platform == "linux" and not glob.glob("/dev/video*"):
+        return False
+    return True
 
 # ── macOS: prevent startup freeze ────────────────────────────────────────────
 # cv2.VideoCapture() requests camera permission via the system dialog when
@@ -23,10 +45,17 @@ class CameraStream:
         self.process_width = process_width
         self.process_height = process_height
         self._settings = settings
-        self._index = int(settings["camera_index"])
+        self._index = int(settings.get("camera_index", 0))
         self.cap = None
         self.opened = False
         self._read_fail_streak = 0
+        self.enabled = local_camera_enabled(settings)
+        if not self.enabled:
+            print(
+                "[Auty] Local camera disabled (headless/API mode). "
+                "Use the browser or iPad camera with /api/recognize-frame."
+            )
+            return
         self._open()
 
     def _open(self) -> bool:
@@ -76,7 +105,7 @@ class CameraStream:
 
     def read(self):
         """Returns (ok, bgr_frame) at process resolution, mirrored."""
-        if not self.opened:
+        if not self.enabled or not self.opened:
             return False, None
 
         frame = None
@@ -105,6 +134,8 @@ class CameraStream:
         return True, frame
 
     def release(self):
+        if not self.enabled:
+            return
         if self.cap is not None:
             try:
                 self.cap.release()

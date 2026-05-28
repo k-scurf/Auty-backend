@@ -15,6 +15,7 @@ from utils.paths import (
 )
 
 DEFAULT_SETTINGS = {
+    "use_local_camera": True,
     "camera_index": 0,
     "model_name": "ArcFace",
     "detector_backend": "insightface",
@@ -215,4 +216,6 @@ def load_settings() -> dict:
     merged["attendance_notes_path"] = str(ATTENDANCE_NOTES_PATH)
     merged["consent_log_path"] = str(CONSENT_LOG_PATH)
     merged["audit_log_path"] = str(AUDIT_LOG_PATH)
+    if os.environ.get("AUTY_INSIGHTFACE_PACK"):
+        merged["insightface_pack"] = os.environ["AUTY_INSIGHTFACE_PACK"]
     return merged
