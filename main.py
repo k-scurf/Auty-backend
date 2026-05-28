@@ -5,6 +5,7 @@ import threading
 from pathlib import Path
 
 import uvicorn
+from server.main import app as app
 
 _CERTS_DIR = Path(__file__).parent / "certs"
 _CERT = _CERTS_DIR / "server.crt"
