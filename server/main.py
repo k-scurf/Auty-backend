@@ -160,7 +160,8 @@ app = FastAPI(title="Auty API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "https://your-app.vercel.app",
+        "https://auty.app",
+        "https://www.auty.app",
         "http://localhost:5173",
         "http://127.0.0.1:5173",
         "http://localhost:4173",
