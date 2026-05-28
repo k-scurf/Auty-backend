@@ -1,3 +1,7 @@
+# Build tooling (sdists like filterpy need setuptools on CI)
+setuptools>=68.0
+wheel>=0.42
+
 # Auty — production vision pipeline
 opencv-python>=4.8.0
 numpy>=1.24.0
