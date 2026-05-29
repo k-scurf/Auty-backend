@@ -834,7 +834,7 @@ export function EnrollmentFlow({ onDone }: Props) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex flex-col items-center justify-center bg-bg/95 backdrop-blur p-4">
+    <div className="fixed inset-0 z-[100] flex min-h-screen min-w-full flex-col items-center justify-center bg-bg p-4">
       {/* Step indicator */}
       <div className="flex items-center gap-0 mb-8 w-full max-w-lg">
         {STEP_LABELS.map((label, i) => {

@@ -227,6 +227,11 @@ export async function requestDataDeletion(employeeId: string): Promise<void> {
   await api.post(`/api/consent/${encodeURIComponent(employeeId)}/delete`);
 }
 
+/** Remove one employee's profile and biometric data from the server. */
+export async function deleteProfile(profileId: string): Promise<void> {
+  await api.delete(`/api/profiles/${encodeURIComponent(profileId)}`);
+}
+
 export async function resetAllProfiles(): Promise<void> {
   await api.post("/api/profiles/reset-all");
 }

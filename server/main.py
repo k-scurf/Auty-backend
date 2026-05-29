@@ -460,10 +460,14 @@ def list_profiles():
 def delete_profile(profile_id: str):
     eng = require_engine()
     prof = eng.db.get_profile_by_id(profile_id)
-    if not prof:
-        raise HTTPException(status_code=404, detail="Profile not found")
-    eng.db.delete_profile(name=prof.get("name"), rec_id=profile_id)
-    return {"ok": True}
+    if prof:
+        eng.db.delete_profile(name=prof.get("name"), rec_id=profile_id)
+        return {"ok": True}
+    # Legacy rows may only have a display name in profiles.json
+    if eng.db.get_profile(profile_id):
+        eng.db.delete_profile(name=profile_id)
+        return {"ok": True}
+    raise HTTPException(status_code=404, detail="Profile not found")
 
 
 @app.post("/api/recognize-frame", response_model=FrameSnapshotOut)

@@ -166,8 +166,9 @@ export function KioskPage() {
   const imgSrc = useFrameJpeg();
   const { videoRef, error: cameraError, active: cameraActive } = useDeviceCamera(USE_DEVICE_CAMERA, "front");
   const [showPin, setShowPin] = useState(false);
-  const [tapCount, setTapCount] = useState(0);
+  const [, setTapCount] = useState(0);
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastExitCornerMs = useRef(0);
   const [pinBuffer, setPinBuffer] = useState("");
   const [pinError, setPinError] = useState(false);
   const [kioskPin, setKioskPin] = useState("1234");
@@ -384,15 +385,42 @@ export function KioskPage() {
     }
   }, [cameraActive, cameraError]);
 
-  const handleCornerTap = () => {
-    setTapCount((c) => c + 1);
-    if (tapTimer.current) clearTimeout(tapTimer.current);
-    tapTimer.current = setTimeout(() => setTapCount(0), 800);
-    if (tapCount + 1 >= 3) {
-      setTapCount(0);
-      setShowPin(true);
-    }
-  };
+  const EXIT_TAP_RESET_MS = 1500;
+
+  const registerExitCornerTap = useCallback(() => {
+    const now = Date.now();
+    if (now - lastExitCornerMs.current < 250) return;
+    lastExitCornerMs.current = now;
+
+    setTapCount((prev) => {
+      const next = prev + 1;
+      if (tapTimer.current) clearTimeout(tapTimer.current);
+      if (next >= 3) {
+        tapTimer.current = setTimeout(() => setTapCount(0), EXIT_TAP_RESET_MS);
+        setShowPin(true);
+        return 0;
+      }
+      tapTimer.current = setTimeout(() => setTapCount(0), EXIT_TAP_RESET_MS);
+      return next;
+    });
+  }, []);
+
+  const handleExitCornerPointerUp = useCallback(
+    (e: React.PointerEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      if (e.pointerType === "mouse" && e.button !== 0) return;
+      registerExitCornerTap();
+    },
+    [registerExitCornerTap],
+  );
+
+  const handleExitCornerClick = useCallback(
+    (e: React.MouseEvent<HTMLButtonElement>) => {
+      e.preventDefault();
+      registerExitCornerTap();
+    },
+    [registerExitCornerTap],
+  );
 
   const handlePinKey = useCallback((key: string) => {
     const next = (pinBuffer + key).slice(-4);
@@ -556,9 +584,11 @@ export function KioskPage() {
       </div>
 
       <button
-        onClick={handleCornerTap}
+        type="button"
+        onPointerUp={handleExitCornerPointerUp}
+        onClick={handleExitCornerClick}
         aria-label="Manager access"
-        className="absolute top-0 right-0 h-20 w-20 opacity-0"
+        className="absolute top-0 right-0 z-[60] min-h-[80px] min-w-[80px] h-20 w-20 touch-manipulation opacity-0"
       />
 
       <AnimatePresence>

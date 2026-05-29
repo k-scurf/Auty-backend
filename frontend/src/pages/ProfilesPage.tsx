@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { fetchProfiles, requestDataDeletion, profilePhotoUrl } from "../services/api";
+import { deleteProfile, fetchProfiles, profilePhotoUrl } from "../services/api";
 import { EnrollmentFlow } from "../components/enrollment/EnrollmentFlow";
 import { ScheduleEditor } from "../components/dashboard/ScheduleEditor";
 import { useWebSocket } from "../hooks/useWebSocket";
@@ -19,12 +19,23 @@ function ProfileCard({
   onScheduleClick: () => void;
 }) {
   const [confirming, setConfirming] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const handleDelete = async () => {
-    if (!profile.id) return;
-    await requestDataDeletion(profile.id).catch(() => {});
-    setConfirming(false);
-    onDeleteRequest();
+    const profileKey = (profile.id ?? profile.name).trim();
+    if (!profileKey) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteProfile(profileKey);
+      setConfirming(false);
+      onDeleteRequest();
+    } catch {
+      setDeleteError("Could not delete employee. Check the server connection and try again.");
+    } finally {
+      setDeleting(false);
+    }
   };
 
   const enrolledDate = profile.enrolled_at
@@ -74,10 +85,27 @@ function ProfileCard({
         </div>
       ) : (
         <div className="rounded-card border border-danger/30 bg-danger/5 p-3 space-y-2">
-          <p className="text-xs text-danger">Request deletion of {profile.name}'s biometric data?</p>
+          <p className="text-xs text-danger">
+            Permanently delete {profile.name} and all biometric data?
+          </p>
+          {deleteError && <p className="text-xs text-danger">{deleteError}</p>}
           <div className="flex gap-2">
-            <button onClick={() => setConfirming(false)} className="btn-ghost text-xs flex-1 py-1">Cancel</button>
-            <button onClick={handleDelete} className="btn-danger text-xs flex-1 py-1">Confirm</button>
+            <button
+              type="button"
+              onClick={() => { setConfirming(false); setDeleteError(null); }}
+              className="btn-ghost text-xs flex-1 py-1"
+              disabled={deleting}
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleDelete}
+              className="btn-danger text-xs flex-1 py-1"
+              disabled={deleting}
+            >
+              {deleting ? "Deleting…" : "Confirm"}
+            </button>
           </div>
         </div>
       )}
