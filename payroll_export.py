@@ -230,6 +230,75 @@ def build_export_csv(
     raise ValueError(f"Unsupported format: {fmt}")
 
 
+def compute_preview_from_events(
+    events: List[dict],
+    format: str,
+    start_date: str,
+    end_date: str,
+    location_id: Optional[str] = None,
+    tz_name: str = "UTC",
+) -> dict:
+    """Preview summary from a pre-fetched event list."""
+    tz = _resolve_tz(tz_name)
+    filtered = _filter_events(events, start_date, end_date, location_id, tz)
+    shifts = _pair_events(filtered, tz)
+    total_seconds = sum(s["duration_seconds"] for s in shifts)
+    employee_names = {s["name"] for s in shifts}
+    return {
+        "row_count": len(shifts),
+        "total_hours": _decimal_hours(total_seconds),
+        "employee_count": len(employee_names),
+        "format": format,
+        "start_date": start_date,
+        "end_date": end_date,
+    }
+
+
+def build_export_csv_from_events(
+    events: List[dict],
+    format: str,
+    start_date: str,
+    end_date: str,
+    location_id: Optional[str] = None,
+    tz_name: str = "UTC",
+) -> str:
+    fmt = format.lower().strip()
+    if fmt not in SUPPORTED_FORMATS:
+        raise ValueError(f"Unsupported format: {format!r}. Use: {SUPPORTED_FORMATS}")
+    tz = _resolve_tz(tz_name)
+    filtered = _filter_events(events, start_date, end_date, location_id, tz)
+    shifts = _pair_events(filtered, tz)
+    if fmt == "gusto":
+        return _gusto_csv(shifts, tz)
+    if fmt == "adp":
+        return _adp_csv(shifts, tz)
+    if fmt == "square":
+        return _square_csv(shifts, tz)
+    raise ValueError(f"Unsupported format: {fmt}")
+
+
+def _filter_events(
+    events: List[dict],
+    start_date: str,
+    end_date: str,
+    location_id: Optional[str],
+    tz,
+) -> List[dict]:
+    start_ts = _midnight_ts(start_date, tz)
+    end_ts = _midnight_ts(end_date, tz, offset_days=1)
+    out = []
+    for ev in events:
+        ts = ev.get("timestamp_ts", 0)
+        if start_ts is not None and ts < start_ts:
+            continue
+        if end_ts is not None and ts > end_ts:
+            continue
+        if location_id and ev.get("location_id") != location_id:
+            continue
+        out.append(ev)
+    return out
+
+
 def compute_preview(
     tracker: AttendanceTracker,
     format: str,
@@ -241,14 +310,8 @@ def compute_preview(
     """Return a preview summary without generating the full CSV."""
     tz = _resolve_tz(tz_name)
     events = _get_events(tracker, start_date, end_date, location_id, tz)
-    shifts = _pair_events(events, tz)
-    total_seconds = sum(s["duration_seconds"] for s in shifts)
-    employee_names = {s["name"] for s in shifts}
-    return {
-        "row_count": len(shifts),
-        "total_hours": _decimal_hours(total_seconds),
-        "employee_count": len(employee_names),
-        "format": format,
-        "start_date": start_date,
-        "end_date": end_date,
-    }
+    return compute_preview_from_events(
+        events, format, start_date, end_date, location_id, tz_name=tz_name
+    )
+
+

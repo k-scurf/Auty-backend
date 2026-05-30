@@ -102,6 +102,17 @@ class LoginResponse(BaseModel):
     expires_at: str
 
 
+class TenantCreate(BaseModel):
+    name: str = ""
+    username: str
+    password: str
+
+
+class TenantCreatedOut(BaseModel):
+    id: str
+    username: str
+
+
 class ExportRequest(BaseModel):
     format: str  # gusto | adp | square
     start_date: str  # YYYY-MM-DD

@@ -414,8 +414,31 @@ class AttendanceTracker:
         )
 
     def _append_log(self, event: AttendanceEvent):
+        payload = event.to_dict()
         with open(self._log_path, "a") as f:
-            f.write(json.dumps(event.to_dict()) + "\n")
+            f.write(json.dumps(payload) + "\n")
+        self._maybe_persist_postgres(payload)
+
+    def _maybe_persist_postgres(self, event: dict) -> None:
+        if not os.environ.get("DATABASE_URL"):
+            return
+        try:
+            from auty.db.context import get_current_tenant_context
+            from auty.db.connection import get_session_factory
+            from auty.db.repositories import insert_attendance_event
+
+            tenant_id = get_current_tenant_context()
+            if tenant_id is None:
+                from auty.auth import get_default_tenant_id
+
+                tenant_id = get_default_tenant_id()
+            db = get_session_factory()()
+            try:
+                insert_attendance_event(db, tenant_id, event)
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[attendance] PostgreSQL persist skipped: {exc}")
 
     def _load_notes(self) -> dict:
         try:

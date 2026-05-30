@@ -491,7 +491,82 @@ class VisionEngine:
                 )
             return self._latest.payload
 
-    def recognize_client_frame(self, jpeg_bytes: bytes) -> FrameSnapshotOut:
+    def _postgres_enabled(self) -> bool:
+        return bool(os.environ.get("DATABASE_URL"))
+
+    def _resolve_face_db(self) -> Dict[str, List]:
+        """Recognition gallery: PostgreSQL per tenant when configured, else file store."""
+        if not self._postgres_enabled():
+            return self.db.face_db
+
+        tenant_id = None
+        try:
+            from auty.db.context import get_current_tenant_context
+
+            tenant_id = get_current_tenant_context()
+        except ImportError:
+            pass
+
+        if tenant_id is None:
+            try:
+                from auty.auth import get_default_tenant_id
+
+                tenant_id = get_default_tenant_id()
+            except Exception:
+                return self.db.face_db
+
+        try:
+            import uuid as _uuid
+
+            from auty.db.connection import get_session_factory
+            from auty.db.embedding_store import load_tenant_gallery
+
+            db = get_session_factory()()
+            try:
+                gallery = load_tenant_gallery(db, _uuid.UUID(str(tenant_id)))
+                if gallery:
+                    return gallery
+            finally:
+                db.close()
+        except Exception as exc:
+            print(f"[Auty] PostgreSQL gallery load failed, using file store: {exc}")
+        return self.db.face_db
+
+    def persist_embeddings_to_postgres(self, tenant_id, name: str) -> None:
+        """Write identity-store embeddings to PostgreSQL for this tenant."""
+        if not self._postgres_enabled():
+            return
+        rec = self.db.store.find_by_name(name)
+        if rec is None:
+            return
+        try:
+            import uuid as _uuid
+
+            employee_id = _uuid.UUID(str(rec.id))
+            tenant_uuid = _uuid.UUID(str(tenant_id))
+        except (ValueError, TypeError):
+            return
+
+        embs = [np.asarray(e, dtype=np.float32) for e in rec.embeddings if e is not None]
+        if not embs:
+            samples = self.db.face_db.get(name) or []
+            embs = [np.asarray(e, dtype=np.float32) for e in samples]
+
+        if not embs:
+            return
+
+        from auty.db.connection import get_session_factory
+        from auty.db.embedding_store import save_embeddings
+
+        db = get_session_factory()()
+        try:
+            save_embeddings(db, employee_id, tenant_uuid, embs)
+        finally:
+            db.close()
+
+    def recognize_client_frame(
+        self, jpeg_bytes: bytes, face_db: Optional[Dict[str, List]] = None
+    ) -> FrameSnapshotOut:
         """Process a JPEG sent by the client device (e.g. iPad camera).
 
         Stateless relative to the server camera loop: runs detection +
@@ -531,7 +606,8 @@ class VisionEngine:
             "presence_min_lock_score",
             self.settings.get("min_lock_score", 0.62),
         ))
-        name, score, _second, _dist = match_identity(self.db.face_db, embedding)
+        gallery = face_db if face_db is not None else self._resolve_face_db()
+        name, score, _second, _dist = match_identity(gallery, embedding)
         if not name or name == "UNKNOWN" or score < min_score:
             return self.get_snapshot()
 
@@ -542,6 +618,26 @@ class VisionEngine:
 
         profile = self.db.get_profile(name) or {}
         employee_id = str(profile.get("id") or name)
+        if self._postgres_enabled():
+            try:
+                from auty.db.context import get_current_tenant_context
+                from auty.db.connection import get_session_factory
+                from auty.db import repositories as repo
+
+                tid = get_current_tenant_context()
+                if tid is None:
+                    from auty.auth import get_default_tenant_id
+
+                    tid = get_default_tenant_id()
+                db = get_session_factory()()
+                try:
+                    row = repo.get_employee_by_name(db, tid, name)
+                    if row is not None:
+                        employee_id = str(row.id)
+                finally:
+                    db.close()
+            except Exception:
+                pass
         already_clocked_in = self.attendance_tracker.is_clocked_in(name)
         event = self.attendance_tracker.record_recognition(
             name=name, employee_id=employee_id, confidence=score
@@ -609,8 +705,8 @@ class VisionEngine:
             )
         return {
             "camera_ok": cam_ok,
-            "db_loaded": bool(self.db.face_db),
-            "face_count": len(self.db.face_db),
+            "db_loaded": bool(gallery := self._resolve_face_db()),
+            "face_count": sum(len(v) for v in gallery.values()),
             "profile_count": len(self.db.load_profiles()),
             "fps": round(fps, 1),
             "uptime_seconds": round(time.time() - self._started_at, 1),
@@ -934,11 +1030,12 @@ class VisionEngine:
         if track is None:
             return
         had = embedding is not None
-        if self.db.face_db:
+        gallery = self._resolve_face_db()
+        if gallery:
             from vision.matcher import sync_gallery
 
-            sync_gallery(self.db.face_db, self.db.store)
-            rec.apply_embedding_to_track(self.db.face_db, track, embedding)
+            sync_gallery(gallery, self.db.store)
+            rec.apply_embedding_to_track(gallery, track, embedding)
         self._bump_stability(track, had_embedding=had)
         if had and track.get("locked_name", "UNKNOWN") != "UNKNOWN":
             emb = track.get("last_embedding")
@@ -1386,8 +1483,9 @@ class VisionEngine:
             if track.get("locked_name", "UNKNOWN") == "UNKNOWN" and not fq.passed:
                 track["stable_count"] = 0
 
+            gallery = self._resolve_face_db()
             need_rec = (
-                bool(self.db.face_db)
+                bool(gallery)
                 and self._should_run_recognition(track)
                 and fq.passed
             )
@@ -1416,7 +1514,7 @@ class VisionEngine:
                 else:
                     track["last_recognition_frame"] = self._frame_count
                     track["last_recognition_time"] = time.time()
-                    rec.recognize_track(self.db.face_db, track, aligned)
+                    rec.recognize_track(gallery, track, aligned)
                     self._bump_stability(
                         track, had_embedding=track.get("last_embedding") is not None
                     )
@@ -1743,7 +1841,8 @@ class VisionEngine:
 
             sync_gallery(self.db.face_db, self.db.store)
             self.response_engine.on_profile_saved(name)
-            n_samples = len(self.db.face_db.get(name, []))
+            gallery = self._resolve_face_db()
+            n_samples = len(gallery.get(name, []))
             if n_samples == 0:
                 return (
                     False,
@@ -1756,6 +1855,14 @@ class VisionEngine:
                     f"LOW_CONFIDENCE:{confidence}",
                 )
             print(f"[Auty] Enrolled {name} ({n_samples} embedding(s) in database)")
+            try:
+                from auty.db.context import get_current_tenant_context
+
+                tid = get_current_tenant_context()
+                if tid is not None:
+                    self.persist_embeddings_to_postgres(tid, name)
+            except Exception as persist_exc:
+                print(f"[Auty] PostgreSQL embedding persist: {persist_exc}")
         except Exception as exc:
             print(f"[Auty] Enrollment error: {exc}")
             import traceback

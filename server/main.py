@@ -4,6 +4,13 @@ FastAPI entry: MJPEG stream, WebSocket frame metadata, REST API.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path as _Path
+
+_src = _Path(__file__).resolve().parents[1] / "src"
+if _src.is_dir() and str(_src) not in sys.path:
+    sys.path.insert(0, str(_src))
+
 import asyncio
 import base64
 import datetime as dt
@@ -15,13 +22,14 @@ import threading
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+import uuid
 from typing import Optional
 from zoneinfo import ZoneInfo
 
 import cv2
 import numpy as np
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -43,6 +51,8 @@ from server.schemas import (
     HealthOut,
     LoginRequest,
     LoginResponse,
+    TenantCreate,
+    TenantCreatedOut,
     PresenceOut,
     ProfileCreate,
     ProfileOut,
@@ -56,9 +66,68 @@ from utils.paths import default_settings_path, ensure_directories
 
 from attendance_schedules import DEFAULT_TZ, DAYS, ScheduleStore, normalize_schedule
 import database as db_mod
-from payroll_export import build_export_csv, compute_preview
+from payroll_export import (
+    build_export_csv,
+    build_export_csv_from_events,
+    compute_preview,
+    compute_preview_from_events,
+)
 
 ensure_directories()
+
+from auty.auth import optional_tenant  # noqa: E402
+
+
+def _pg_enabled() -> bool:
+    return bool(os.environ.get("DATABASE_URL"))
+
+
+def _open_db():
+    from auty.db.connection import get_session_factory
+
+    return get_session_factory()()
+
+
+def _sync_profile_to_db(
+    tenant_id: uuid.UUID, name: str, age: str, status: str, image_path: Optional[str] = None
+) -> None:
+    from auty.db import repositories as repo
+
+    employee_id: Optional[uuid.UUID] = None
+    eng = vision_ref()
+    if eng is not None:
+        identity = eng.db.store.find_by_name(name)
+        if identity:
+            try:
+                employee_id = uuid.UUID(str(identity.id))
+            except ValueError:
+                employee_id = None
+
+    db = _open_db()
+    try:
+        row = repo.get_employee_by_name(db, tenant_id, name)
+        if row is None:
+            repo.create_employee(
+                db,
+                tenant_id,
+                name=name,
+                age=age,
+                status=status,
+                photo_path=image_path,
+                employee_id=employee_id,
+            )
+        else:
+            repo.update_employee(
+                db,
+                tenant_id,
+                row.id,
+                name=name,
+                age=age,
+                status=status,
+                photo_path=image_path or row.photo_path,
+            )
+    finally:
+        db.close()
 
 
 class _QuietFrameAccessLog(logging.Filter):
@@ -140,6 +209,21 @@ def _boot_vision_engine():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _vision, _INDEX_BYTES
+    # Additive PostgreSQL init; file-based storage remains until migration Phase 5.
+    if os.environ.get("DATABASE_URL"):
+        from auty.db.bootstrap import ensure_default_tenant
+        from auty.db.connection import get_session_factory
+        from auty.db.init_db import create_all_tables
+
+        create_all_tables()
+        db = get_session_factory()()
+        try:
+            ensure_default_tenant(db)
+        finally:
+            db.close()
+        print("[Auty] PostgreSQL tables ready")
+    else:
+        print("[Auty] DATABASE_URL not set — skipping PostgreSQL init")
     if _ui_built():
         _INDEX_BYTES = _INDEX.read_bytes()
         url = "http://127.0.0.1:8000"
@@ -213,6 +297,24 @@ def vision_ref() -> Optional[VisionEngine]:
 
 @app.post("/api/auth/login", response_model=LoginResponse)
 def login(body: LoginRequest):
+    if os.environ.get("DATABASE_URL"):
+        from auty.auth import authenticate_tenant, create_jwt
+        from auty.db.connection import get_session_factory
+
+        db = get_session_factory()()
+        try:
+            tenant = authenticate_tenant(db, body.username, body.password)
+            if tenant is None:
+                raise HTTPException(
+                    status_code=401, detail="Incorrect username or password"
+                )
+            token, expires_at_dt = create_jwt(tenant.id, tenant.username)
+            expires_at = expires_at_dt.isoformat().replace("+00:00", "Z")
+            return LoginResponse(token=token, expires_at=expires_at)
+        finally:
+            db.close()
+
+    # Legacy file-based auth (backup until data migration Phase 5)
     settings = load_settings()
     expected_username = str(
         os.environ.get("AUTY_MANAGER_USERNAME")
@@ -234,6 +336,42 @@ def login(body: LoginRequest):
     nonce = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
     token = f"local_{expected_username}_{nonce}"
     return LoginResponse(token=token, expires_at=expires_at)
+
+
+@app.post("/api/admin/tenants", response_model=TenantCreatedOut)
+def admin_create_tenant(
+    body: TenantCreate,
+    admin_secret: str = Header(..., alias="ADMIN_SECRET"),
+):
+    if not os.environ.get("DATABASE_URL"):
+        raise HTTPException(status_code=503, detail="Database not configured")
+
+    from auty.auth import hash_password, verify_admin_secret
+    from auty.db.connection import get_session_factory
+    from auty.db.models import Tenant
+    from sqlalchemy import select
+
+    verify_admin_secret(admin_secret)
+
+    username = body.username.strip()
+    if not username or not body.password:
+        raise HTTPException(status_code=400, detail="username and password are required")
+
+    db = get_session_factory()()
+    try:
+        if db.scalar(select(Tenant.id).where(Tenant.username == username)):
+            raise HTTPException(status_code=409, detail="Username already exists")
+        tenant = Tenant(
+            name=(body.name or username).strip(),
+            username=username,
+            password_hash=hash_password(body.password),
+        )
+        db.add(tenant)
+        db.commit()
+        db.refresh(tenant)
+        return TenantCreatedOut(id=str(tenant.id), username=tenant.username)
+    finally:
+        db.close()
 
 
 @app.get("/api/health/live")
@@ -437,7 +575,15 @@ def get_alerts():
 
 
 @app.get("/api/profiles", response_model=list[ProfileOut])
-def list_profiles():
+def list_profiles(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            return [ProfileOut(**p) for p in repo.list_employees(db, tenant_id)]
+        finally:
+            db.close()
     eng = require_engine()
     data = eng.db.load_profiles()
     out = []
@@ -457,13 +603,45 @@ def list_profiles():
 
 
 @app.delete("/api/profiles/{profile_id}")
-def delete_profile(profile_id: str):
+def delete_profile(
+    profile_id: str,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        eid: Optional[uuid.UUID] = None
+        try:
+            try:
+                eid = uuid.UUID(profile_id)
+            except ValueError:
+                eid = None
+            deleted = False
+            if eid is not None:
+                row = repo.get_employee_by_id(db, tenant_id, eid)
+                if row:
+                    repo.delete_employee(db, tenant_id, eid)
+                    deleted = True
+                    profile_id = row.name
+            if not deleted:
+                deleted = repo.delete_employee_by_name(db, tenant_id, profile_id)
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Profile not found")
+        finally:
+            db.close()
+        eng = require_engine()
+        eng.db.delete_profile(name=profile_id, rec_id=str(eid) if eid else None)
+        from auty.db.embedding_store import invalidate_tenant_gallery
+
+        invalidate_tenant_gallery(tenant_id)
+        return {"ok": True}
+
     eng = require_engine()
     prof = eng.db.get_profile_by_id(profile_id)
     if prof:
         eng.db.delete_profile(name=prof.get("name"), rec_id=profile_id)
         return {"ok": True}
-    # Legacy rows may only have a display name in profiles.json
     if eng.db.get_profile(profile_id):
         eng.db.delete_profile(name=profile_id)
         return {"ok": True}
@@ -471,7 +649,10 @@ def delete_profile(profile_id: str):
 
 
 @app.post("/api/recognize-frame", response_model=FrameSnapshotOut)
-async def recognize_frame(file: UploadFile = File(...)):
+async def recognize_frame(
+    file: UploadFile = File(...),
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     """Accept a JPEG from a client device camera (e.g. iPad), run face
     recognition, fire clock-in/out if appropriate, and return a FrameSnapshotOut.
     This endpoint powers the iPad camera path where getUserMedia captures frames
@@ -479,18 +660,54 @@ async def recognize_frame(file: UploadFile = File(...)):
     """
     eng = require_engine()
     jpeg_bytes = await file.read()
+    face_db = None
+    if tenant_id is not None:
+        db = _open_db()
+        try:
+            from auty.db.embedding_store import load_tenant_gallery
+
+            face_db = load_tenant_gallery(db, tenant_id)
+        finally:
+            db.close()
     import asyncio
-    snapshot = await asyncio.to_thread(eng.recognize_client_frame, jpeg_bytes)
+
+    snapshot = await asyncio.to_thread(eng.recognize_client_frame, jpeg_bytes, face_db)
     return snapshot
 
 
 @app.post("/api/profiles/reset-all")
-def reset_all_profiles():
+def reset_all_profiles(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
     """Delete every identity record, face embedding, and profile. Cannot be undone."""
     eng = require_engine()
 
-    # ── 1. Clear on-disk face / profile data ──────────────────────────────
-    eng.db.reset(clear_captures=True)
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+        from auty.db.embedding_store import invalidate_tenant_gallery
+
+        db = _open_db()
+        employee_ids: list[str] = []
+        try:
+            employee_ids = [p["id"] for p in repo.list_employees(db, tenant_id)]
+            repo.reset_tenant_data(db, tenant_id)
+        finally:
+            db.close()
+        invalidate_tenant_gallery(tenant_id)
+
+        for eid in employee_ids:
+            eng.db.store.delete(str(eid))
+        profiles = eng.db.load_profiles()
+        for eid in employee_ids:
+            prof = eng.db.get_profile_by_id(eid)
+            if prof and prof.get("name") in profiles:
+                profiles.pop(prof["name"], None)
+        with open(db_mod.PROFILE_DB, "w") as f:
+            json.dump(profiles, f, indent=4)
+        eng.db._profiles_cache = profiles
+        eng.db.face_db = eng.db.store.build_face_db()
+        eng.db.save()
+    else:
+        # ── Legacy: full file store reset (no PostgreSQL tenant) ─────────────
+        eng.db.reset(clear_captures=True)
 
     # ── 2. Truncate attendance log (zero it out so _load_state_from_log
     #        won't re-populate stale data on next start) ────────────────────
@@ -554,7 +771,26 @@ def enrollment_cancel():
 
 
 @app.get("/api/profiles/{name}")
-def get_profile(name: str):
+def get_profile(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            row = repo.get_employee_by_name(db, tenant_id, name)
+            if row is None:
+                raise HTTPException(status_code=404, detail="Profile not found")
+            return ProfileOut(
+                id=str(row.id),
+                name=row.name,
+                age=row.age or "",
+                status=row.status or "",
+                image=row.photo_path,
+                enrolled_at=row.enrolled_at.isoformat() if row.enrolled_at else None,
+            )
+        finally:
+            db.close()
+
     eng = require_engine()
     p = eng.db.get_profile(name)
     if not p:
@@ -568,7 +804,22 @@ def get_profile(name: str):
 
 
 @app.get("/api/profiles/{name}/photo")
-def profile_photo(name: str):
+def profile_photo(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            row = repo.get_employee_by_name(db, tenant_id, name)
+            if row is None or not row.photo_path:
+                raise HTTPException(status_code=404, detail="Photo not found")
+            path = row.photo_path
+        finally:
+            db.close()
+        if not os.path.isfile(path):
+            raise HTTPException(status_code=404, detail="Photo not found")
+        return FileResponse(path, media_type="image/jpeg")
+
     eng = require_engine()
     p = eng.db.get_profile(name)
     if not p:
@@ -668,7 +919,10 @@ def _validate_enrollment_images(images: list) -> Optional[dict]:
 
 
 @app.post("/api/profiles")
-def create_profile(body: ProfileCreate):
+def create_profile(
+    body: ProfileCreate,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     eng = require_engine()
 
     # Device-camera 3-photo flow: first image is primary, rest add extra embeddings.
@@ -716,6 +970,32 @@ def create_profile(body: ProfileCreate):
                 pass
         print(f"[Auty] POST /api/profiles rejected [{code}]: {msg}")
         raise HTTPException(status_code=status, detail=detail)
+    if tenant_id is not None:
+        prof = eng.db.get_profile(msg) or {}
+        image_path = prof.get("image")
+        if image_path and body.image_b64:
+            from auty.db.repositories import tenant_photos_dir
+
+            photos = tenant_photos_dir(tenant_id)
+            identity = eng.db.store.find_by_name(msg)
+            fname = f"{identity.id if identity else msg}.jpg"
+            dest = photos / fname
+            try:
+                if os.path.isfile(image_path):
+                    import shutil
+
+                    shutil.copy2(image_path, dest)
+                    image_path = str(dest)
+            except OSError:
+                pass
+        _sync_profile_to_db(
+            tenant_id,
+            msg,
+            body.age,
+            body.status,
+            image_path=image_path,
+        )
+        eng.persist_embeddings_to_postgres(tenant_id, msg)
     return {"ok": True, "name": msg}
 
 
@@ -809,7 +1089,21 @@ def skip_enrollment():
 _schedule_store = ScheduleStore()
 
 
-def _employee_records(eng: VisionEngine) -> list[dict]:
+def _employee_records(
+    eng: VisionEngine, tenant_id: Optional[uuid.UUID] = None
+) -> list[dict]:
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            return [
+                {"employee_id": p["id"], "name": p["name"]}
+                for p in repo.list_employees(db, tenant_id)
+            ]
+        finally:
+            db.close()
+
     profiles = eng.db.load_profiles()
     out: list[dict] = []
     for name, profile in profiles.items():
@@ -874,7 +1168,22 @@ def _status_alert(status: str, name: str, minutes: int, shift_start: Optional[st
 
 
 @app.get("/api/schedules/{employee_id}", response_model=WeeklyScheduleOut)
-def get_schedule(employee_id: str):
+def get_schedule(
+    employee_id: str,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            saved = repo.get_schedule(db, tenant_id, employee_id)
+        finally:
+            db.close()
+        if not saved:
+            raise HTTPException(status_code=404, detail="No schedule saved")
+        return WeeklyScheduleOut(**saved)
+
     saved = _schedule_store.get(employee_id)
     if not saved:
         raise HTTPException(status_code=404, detail="No schedule saved")
@@ -882,9 +1191,25 @@ def get_schedule(employee_id: str):
 
 
 @app.post("/api/schedules/{employee_id}", response_model=WeeklyScheduleOut)
-def save_schedule(employee_id: str, body: WeeklyScheduleIn):
+def save_schedule(
+    employee_id: str,
+    body: WeeklyScheduleIn,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     data = body.model_dump()
     data["employee_id"] = employee_id
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            saved = repo.save_schedule(db, tenant_id, employee_id, data)
+        finally:
+            db.close()
+        _schedule_store.save(employee_id, data)  # legacy backup until Phase 5
+        return WeeklyScheduleOut(**saved)
+
     saved = _schedule_store.save(employee_id, data)
     return WeeklyScheduleOut(**saved)
 
@@ -894,8 +1219,17 @@ def save_schedule(employee_id: str, body: WeeklyScheduleIn):
 # ---------------------------------------------------------------------------
 
 @app.get("/api/attendance/active")
-def get_attendance_active():
+def get_attendance_active(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
     """Who is clocked in right now."""
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            return repo.attendance_active_snapshot(db, tenant_id)
+        finally:
+            db.close()
+
     eng = vision_ref()
     if eng is None:
         return {"clocked_in": [], "recent_events": [], "alerts": []}
@@ -906,19 +1240,32 @@ def get_attendance_active():
 
 
 @app.get("/api/attendance/status/today", response_model=TodayAttendanceStatusOut)
-def get_today_attendance_status():
+def get_today_attendance_status(
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     """Every employee's schedule-aware attendance status for today."""
     eng = require_engine()
     tracker = eng.get_attendance_tracker()
-    if tracker is None:
+    if tracker is None and tenant_id is None:
         return TodayAttendanceStatusOut(date=dt.date.today().isoformat(), rows=[])
 
     now_default = dt.datetime.now(_tz(DEFAULT_TZ))
-    all_events = tracker.get_events()
-    schedules = _schedule_store.all()
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            all_events = repo.list_attendance_events(db, tenant_id)
+            schedules = repo.all_schedules(db, tenant_id)
+        finally:
+            db.close()
+    else:
+        all_events = tracker.get_events()
+        schedules = _schedule_store.all()
+
     rows = []
 
-    for employee in _employee_records(eng):
+    for employee in _employee_records(eng, tenant_id):
         employee_id = employee["employee_id"]
         name = employee["name"]
         schedule = schedules.get(employee_id)
@@ -1009,13 +1356,9 @@ def get_attendance_events(
     end_date: Optional[str] = None,
     employee: Optional[str] = None,
     location_id: Optional[str] = None,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
 ):
     """Filterable attendance event log."""
-    eng = require_engine()
-    tracker = eng.get_attendance_tracker()
-    if tracker is None:
-        return []
-
     start_ts: Optional[float] = None
     end_ts: Optional[float] = None
     if start_date:
@@ -1036,18 +1379,54 @@ def get_attendance_events(
         except ValueError:
             pass
 
-    events = tracker.get_events(
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            return repo.list_attendance_events(
+                db,
+                tenant_id,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                employee_name=employee,
+                location_id=location_id,
+            )
+        finally:
+            db.close()
+
+    eng = require_engine()
+    tracker = eng.get_attendance_tracker()
+    if tracker is None:
+        return []
+    return tracker.get_events(
         start_ts=start_ts,
         end_ts=end_ts,
         employee_name=employee,
         location_id=location_id,
     )
-    return events
 
 
 @app.post("/api/attendance/notes")
-def add_attendance_note(body: AttendanceNoteCreate):
+def add_attendance_note(
+    body: AttendanceNoteCreate,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     """Add a manager note to an event (never modifies the original record)."""
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            ok = repo.add_attendance_note(
+                db, tenant_id, body.event_id, body.note, body.manager
+            )
+        finally:
+            db.close()
+        if not ok:
+            raise HTTPException(status_code=404, detail="Event not found")
+        return {"ok": True}
+
     eng = require_engine()
     tracker = eng.get_attendance_tracker()
     if tracker is None:
@@ -1064,39 +1443,88 @@ def preview_export(
     start_date: str = "",
     end_date: str = "",
     location_id: Optional[str] = None,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
 ):
     eng = require_engine()
+    tz_name = str(eng.settings.get("timezone", "UTC"))
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            events = repo.list_attendance_events(db, tenant_id)
+        finally:
+            db.close()
+        preview = compute_preview_from_events(
+            events, format, start_date, end_date, location_id, tz_name=tz_name
+        )
+        return ExportPreviewOut(**preview)
+
     tracker = eng.get_attendance_tracker()
     if tracker is None:
         raise HTTPException(status_code=503, detail="Attendance tracker not ready")
-    tz_name = str(eng.settings.get("timezone", "UTC"))
     preview = compute_preview(tracker, format, start_date, end_date, location_id, tz_name=tz_name)
     return ExportPreviewOut(**preview)
 
 
 @app.post("/api/attendance/export")
-def export_attendance(body: ExportRequest):
+def export_attendance(
+    body: ExportRequest,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     """Generate a payroll CSV for download."""
     eng = require_engine()
-    tracker = eng.get_attendance_tracker()
-    if tracker is None:
-        raise HTTPException(status_code=503, detail="Attendance tracker not ready")
-
     tz_name = str(eng.settings.get("timezone", "UTC"))
-    csv_content = build_export_csv(
-        tracker,
-        body.format,
-        body.start_date,
-        body.end_date,
-        body.location_id,
-        tz_name=tz_name,
-    )
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            events = repo.list_attendance_events(db, tenant_id)
+        finally:
+            db.close()
+        csv_content = build_export_csv_from_events(
+            events,
+            body.format,
+            body.start_date,
+            body.end_date,
+            body.location_id,
+            tz_name=tz_name,
+        )
+        db = _open_db()
+        try:
+            repo.append_audit(
+                db,
+                tenant_id,
+                "export",
+                actor="manager",
+                detail=f"{body.format} {body.start_date}–{body.end_date}",
+            )
+        finally:
+            db.close()
+    else:
+        tracker = eng.get_attendance_tracker()
+        if tracker is None:
+            raise HTTPException(status_code=503, detail="Attendance tracker not ready")
+        csv_content = build_export_csv(
+            tracker,
+            body.format,
+            body.start_date,
+            body.end_date,
+            body.location_id,
+            tz_name=tz_name,
+        )
+        audit = eng.get_audit_log()
+        if audit:
+            audit.log(
+                "export",
+                actor="manager",
+                detail=f"{body.format} {body.start_date}–{body.end_date}",
+            )
+
     filename = f"attendance_{body.format}_{body.start_date}_{body.end_date}.csv"
-
-    audit = eng.get_audit_log()
-    if audit:
-        audit.log("export", actor="manager", detail=f"{body.format} {body.start_date}–{body.end_date}")
-
     return StreamingResponse(
         io.BytesIO(csv_content.encode("utf-8")),
         media_type="text/csv",
@@ -1109,10 +1537,31 @@ def export_attendance(body: ExportRequest):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/consent")
-async def record_consent(body: ConsentCreate, request: Request):
+async def record_consent(
+    body: ConsentCreate,
+    request: Request,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     eng = require_engine()
-    consent_mgr = eng.get_consent_manager()
     ip = body.ip_address or (request.client.host if request.client else "unknown")
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            repo.record_consent(
+                db,
+                tenant_id,
+                employee_id=body.employee_id,
+                employee_name=body.name,
+                ip_address=ip,
+                form_version=body.form_version,
+            )
+        finally:
+            db.close()
+
+    consent_mgr = eng.get_consent_manager()
     consent_mgr.record_consent(
         employee_id=body.employee_id,
         name=body.name,
@@ -1123,7 +1572,27 @@ async def record_consent(body: ConsentCreate, request: Request):
 
 
 @app.get("/api/consent/{employee_id}", response_model=ConsentStatusOut)
-def get_consent_status(employee_id: str):
+def get_consent_status(
+    employee_id: str,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            record = repo.get_consent(db, tenant_id, employee_id)
+        finally:
+            db.close()
+        if record is None:
+            return ConsentStatusOut(employee_id=employee_id, consented=False)
+        return ConsentStatusOut(
+            employee_id=employee_id,
+            consented=record.get("consent_given", False),
+            timestamp_utc=record.get("timestamp_utc"),
+            form_version=record.get("form_version"),
+        )
+
     eng = require_engine()
     consent_mgr = eng.get_consent_manager()
     record = consent_mgr.get_consent(employee_id)
@@ -1138,22 +1607,57 @@ def get_consent_status(employee_id: str):
 
 
 @app.post("/api/consent/{employee_id}/delete")
-async def request_data_deletion(employee_id: str, request: Request):
+async def request_data_deletion(
+    employee_id: str,
+    request: Request,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     eng = require_engine()
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            repo.request_consent_deletion(db, tenant_id, employee_id)
+            repo.append_audit(
+                db,
+                tenant_id,
+                "deletion_request",
+                actor=employee_id,
+                detail="Employee requested biometric data deletion",
+            )
+        finally:
+            db.close()
+
     consent_mgr = eng.get_consent_manager()
     consent_mgr.request_deletion(employee_id)
-    eng.get_audit_log().log(
-        "deletion_request",
-        actor=employee_id,
-        detail="Employee requested biometric data deletion",
-    )
+    audit = eng.get_audit_log()
+    if audit:
+        audit.log(
+            "deletion_request",
+            actor=employee_id,
+            detail="Employee requested biometric data deletion",
+        )
 
     return {"ok": True, "message": "Deletion request recorded. Account owner has been notified."}
 
 
 @app.get("/api/audit")
-def get_audit_log(limit: int = 50):
+def get_audit_log_api(
+    limit: int = 50,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     """Return the last N audit log entries."""
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            return repo.list_audit(db, tenant_id, limit=limit)
+        finally:
+            db.close()
+
     eng = vision_ref()
     if eng is None:
         return []
@@ -1164,18 +1668,30 @@ def get_audit_log(limit: int = 50):
 
 
 @app.get("/api/settings")
-def get_settings():
-    # L1: kiosk_pin is included so the kiosk page can compare it client-side.
-    # For deployments exposed beyond localhost, move PIN verification to a
-    # dedicated server-side endpoint and exclude kiosk_pin from this response.
+def get_settings(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+    base = load_settings()
     eng = vision_ref()
-    if eng is None:
-        return load_settings()
-    return eng.settings
+    if eng is not None:
+        base = {**base, **eng.settings}
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            tenant_settings = repo.get_settings_dict(db, tenant_id)
+        finally:
+            db.close()
+        return {**base, **tenant_settings}
+
+    return base
 
 
 @app.patch("/api/settings")
-def patch_settings(body: SettingsPatch):
+def patch_settings(
+    body: SettingsPatch,
+    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+):
     eng = require_engine()
     _extra_allowed = {
         "attendance_enabled", "attendance_min_confidence", "save_clock_in_snapshot",
@@ -1192,6 +1708,23 @@ def patch_settings(body: SettingsPatch):
     updates = {k: v for k, v in body.settings.items() if k in allowed}
     if not updates:
         raise HTTPException(status_code=400, detail="No valid keys to update")
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            repo.upsert_settings(db, tenant_id, updates)
+            repo.append_audit(
+                db,
+                tenant_id,
+                "settings_change",
+                actor="manager",
+                detail=str(list(updates.keys())),
+            )
+        finally:
+            db.close()
+
     merged = {**eng.settings, **updates}
     path = default_settings_path()
     with open(path, "w") as f:
@@ -1201,6 +1734,15 @@ def patch_settings(body: SettingsPatch):
             indent=2,
         )
     eng.settings = load_settings()
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+
+        db = _open_db()
+        try:
+            tenant_settings = repo.get_settings_dict(db, tenant_id)
+            eng.settings = {**eng.settings, **tenant_settings}
+        finally:
+            db.close()
     import recognition as rec
     from vision import config as vcfg
 
@@ -1211,7 +1753,7 @@ def patch_settings(body: SettingsPatch):
     re.personality_enabled = bool(eng.settings.get("personality_enabled", False))
     re.greeting_bar_enabled = bool(eng.settings.get("greeting_bar_enabled", False))
     audit = eng.get_audit_log()
-    if audit:
+    if audit and tenant_id is None:
         audit.log("settings_change", actor="manager", detail=str(list(updates.keys())))
     return eng.settings
 
