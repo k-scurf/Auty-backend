@@ -341,7 +341,7 @@ def login(body: LoginRequest):
 @app.post("/api/admin/tenants", response_model=TenantCreatedOut)
 def admin_create_tenant(
     body: TenantCreate,
-    admin_secret: str = Header(..., alias="ADMIN_SECRET"),
+    admin_secret: str = Header(..., alias="admin-secret"),
 ):
     if not os.environ.get("DATABASE_URL"):
         raise HTTPException(status_code=503, detail="Database not configured")
