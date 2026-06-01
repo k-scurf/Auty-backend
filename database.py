@@ -4,7 +4,6 @@ Face database — IdentityStore v2 with legacy pickle migration.
 
 import json
 import os
-import pickle
 
 import recognition as rec
 from utils.paths import CAPTURES_DIR, FACE_DB_PATH, PROFILES_PATH, ensure_directories
@@ -49,11 +48,15 @@ class FaceDatabase:
         return normalized
 
     def _migrate_pickle_if_needed(self):
+        # Fix #3: pickle.load() is arbitrary code execution. This migration path
+        # runs at most once — we delete the .pkl file after a successful import
+        # so the unsafe load path is never exercised again.
         if self.face_db:
             return
         if not os.path.exists(FACE_DB):
             return
         try:
+            import pickle  # imported locally so normal code paths never use it
             with open(FACE_DB, "rb") as f:
                 raw = pickle.load(f)
             legacy = self.normalize_face_db(raw)
@@ -69,7 +72,17 @@ class FaceDatabase:
                 )
             self.face_db = self.store.build_face_db()
             print(f"[database] Migrated {len(legacy)} profile(s) to identity v2")
-        except (OSError, pickle.UnpicklingError, EOFError, ValueError) as exc:
+            # Delete the pickle so it can never be loaded again
+            try:
+                os.remove(FACE_DB)
+                print("[database] Removed legacy face_db.pkl after migration")
+            except OSError:
+                pass
+        except (OSError, EOFError, ValueError) as exc:
+            print(f"[database] Pickle migration skipped: {exc}")
+        except Exception as exc:
+            # Catch pickle.UnpicklingError (and any other deserialization error)
+            # without importing pickle at module level.
             print(f"[database] Pickle migration skipped: {exc}")
 
     def load(self):
@@ -80,15 +93,19 @@ class FaceDatabase:
         return self.face_db
 
     def save(self):
+        # Fix #3: IdentityStore already persists embeddings as JSON in data/identities/.
+        # No secondary pickle file is needed or written here.
         self.face_db = self.store.build_face_db()
-        with open(FACE_DB, "wb") as f:
-            pickle.dump(self.face_db, f)
 
     def reset(self, *, clear_captures: bool = True):
         self.store.reset(clear_captures=clear_captures)
         self.face_db = {}
-        with open(FACE_DB, "wb") as f:
-            pickle.dump({}, f)
+        # Remove any leftover legacy pickle file
+        if os.path.exists(FACE_DB):
+            try:
+                os.remove(FACE_DB)
+            except OSError:
+                pass
         with open(PROFILE_DB, "w") as f:
             json.dump({}, f)
         self._profiles_cache = {}

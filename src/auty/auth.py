@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hmac
 import os
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -37,20 +38,33 @@ def hash_password(plain: str) -> str:
 
 
 def _jwt_secret() -> str:
+    # Fix #1 & #6: only accept dedicated JWT_SECRET/AUTY_JWT_SECRET; never fall
+    # back to ADMIN_SECRET (different purpose) or a hardcoded dev string.
     secret = (
         os.environ.get("JWT_SECRET", "").strip()
         or os.environ.get("AUTY_JWT_SECRET", "").strip()
-        or os.environ.get("ADMIN_SECRET", "").strip()
     )
     if secret:
         return secret
     if get_database_url():
-        print(
-            "[Auty] WARNING: JWT_SECRET not set; using insecure dev default. "
-            "Set JWT_SECRET in production."
+        raise RuntimeError(
+            "JWT_SECRET environment variable is required when DATABASE_URL is set. "
+            "Generate one with: python -c \"import secrets; print(secrets.token_hex(32))\""
         )
-        return "auty-dev-insecure-jwt-secret-change-me"
-    return "auty-local-no-db"
+    # Legacy local-only mode (no DB): use a per-process secret so tokens are
+    # verifiable within a single server run but not forgeable across restarts.
+    return _local_jwt_secret()
+
+
+_LOCAL_JWT_SECRET: Optional[str] = None
+
+
+def _local_jwt_secret() -> str:
+    global _LOCAL_JWT_SECRET
+    if _LOCAL_JWT_SECRET is None:
+        import secrets
+        _LOCAL_JWT_SECRET = secrets.token_hex(32)
+    return _LOCAL_JWT_SECRET
 
 
 def create_jwt(tenant_id: uuid.UUID, username: str) -> tuple[str, datetime]:
@@ -147,10 +161,17 @@ def get_current_tenant(
 def verify_admin_secret(admin_secret: str) -> None:
     """Validate ADMIN_SECRET header value."""
     expected = os.environ.get("ADMIN_SECRET", "").strip()
-    if not expected or admin_secret.strip() != expected:
+    # Fix #13: distinguish "not configured" from "wrong secret"
+    if not expected:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Admin endpoint is not configured on this server (ADMIN_SECRET unset)",
+        )
+    # Fix #10: constant-time comparison to prevent timing attacks
+    if not hmac.compare_digest(admin_secret.strip(), expected):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Invalid or missing admin secret",
+            detail="Invalid admin secret",
         )
 
 
@@ -164,3 +185,43 @@ def authenticate_tenant(
     if not verify_password(password, tenant.password_hash):
         return None
     return tenant
+
+
+def require_tenant(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
+) -> Optional[uuid.UUID]:
+    """Fix #2: JWT required for manager/admin endpoints when DB is configured.
+
+    - DB mode: valid Bearer JWT is mandatory; 401 if absent or invalid.
+    - Legacy local mode (no DB): JWT is verified if provided, but not required,
+      since file-based mode is intended for local-only deployments.
+    """
+    if get_database_url():
+        if credentials is None or credentials.scheme.lower() != "bearer":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not authenticated",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        tenant_id = decode_jwt(credentials.credentials)
+        set_current_tenant(tenant_id)
+        return tenant_id
+
+    # Legacy local mode: verify the token signature if one is presented so that
+    # a stale or tampered token from a previous session is rejected.
+    if credentials is not None and credentials.scheme.lower() == "bearer":
+        try:
+            jwt.decode(credentials.credentials, _jwt_secret(), algorithms=[JWT_ALGORITHM])
+        except JWTError:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+    return None
+
+
+def clear_default_tenant_cache() -> None:
+    """Fix #15: Invalidate the cached default tenant ID (e.g. after tenant deletion)."""
+    global _default_tenant_id
+    _default_tenant_id = None

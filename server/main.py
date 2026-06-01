@@ -13,11 +13,14 @@ if _src.is_dir() and str(_src) not in sys.path:
 
 import asyncio
 import base64
+import collections
 import datetime as dt
+import hmac
 import io
 import json
 import logging
 import os
+import re
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -75,7 +78,36 @@ from payroll_export import (
 
 ensure_directories()
 
-from auty.auth import optional_tenant  # noqa: E402
+from auty.auth import optional_tenant, require_tenant  # noqa: E402
+
+# Fix #9: maximum bytes accepted for any uploaded or base64-encoded image
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 20 MB
+
+# Fix #8: simple in-memory rate limiter for the login endpoint
+_LOGIN_RATE_WINDOW = 300   # seconds
+_LOGIN_RATE_MAX = 10       # attempts per window per IP
+_login_lock = threading.Lock()
+_login_attempts: dict[str, list[float]] = collections.defaultdict(list)
+
+
+def _check_login_rate(ip: str) -> None:
+    now = time.time()
+    cutoff = now - _LOGIN_RATE_WINDOW
+    with _login_lock:
+        attempts = [t for t in _login_attempts[ip] if t > cutoff]
+        if len(attempts) >= _LOGIN_RATE_MAX:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many login attempts — please wait before trying again.",
+                headers={"Retry-After": str(_LOGIN_RATE_WINDOW)},
+            )
+        attempts.append(now)
+        _login_attempts[ip] = attempts
+
+
+def _safe_filename_part(s: str) -> str:
+    """Fix #12: strip characters that could inject into Content-Disposition headers."""
+    return re.sub(r"[^A-Za-z0-9_\-]", "_", str(s))[:40]
 
 
 def _pg_enabled() -> bool:
@@ -264,21 +296,26 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Auty API", version="1.0.0", lifespan=lifespan)
 
+# Fix #7: allow_credentials=True with a broad LAN regex lets any page on the
+# local network make credentialed cross-origin requests.  Auth uses Bearer
+# tokens (not cookies), so credentials=False is safe and closes the CSRF risk.
+# Operators can add extra origins via AUTY_EXTRA_ORIGINS (comma-separated).
+_CORS_ORIGINS = [
+    "https://auty.app",
+    "https://www.auty.app",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:4173",
+    "http://127.0.0.1:4173",
+]
+_extra = [o.strip() for o in os.environ.get("AUTY_EXTRA_ORIGINS", "").split(",") if o.strip()]
+_CORS_ORIGINS.extend(_extra)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://auty.app",
-        "https://www.auty.app",
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-        "http://localhost:4173",
-        "http://127.0.0.1:4173",
-        # Allow all origins for HTTPS LAN access (iPad, etc.)
-        # The app self-hosts the frontend, so there's no cross-origin risk.
-        "https://192.168.1.100:8000",
-    ],
+    allow_origins=_CORS_ORIGINS,
     allow_origin_regex=r"https?://192\.168\.\d+\.\d+(:\d+)?",
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -296,7 +333,11 @@ def vision_ref() -> Optional[VisionEngine]:
 
 
 @app.post("/api/auth/login", response_model=LoginResponse)
-def login(body: LoginRequest):
+def login(body: LoginRequest, request: Request):
+    # Fix #8: rate-limit before doing any credential work
+    client_ip = request.client.host if request.client else "unknown"
+    _check_login_rate(client_ip)
+
     if os.environ.get("DATABASE_URL"):
         from auty.auth import authenticate_tenant, create_jwt
         from auty.db.connection import get_session_factory
@@ -314,7 +355,7 @@ def login(body: LoginRequest):
         finally:
             db.close()
 
-    # Legacy file-based auth (backup until data migration Phase 5)
+    # Legacy file-based auth (local-only mode; no DB)
     settings = load_settings()
     expected_username = str(
         os.environ.get("AUTY_MANAGER_USERNAME")
@@ -328,13 +369,17 @@ def login(body: LoginRequest):
         or "1234"
     )
 
-    if body.username.strip() != expected_username or body.password != expected_password:
+    # Fix #10: constant-time comparison to prevent timing attacks
+    username_ok = hmac.compare_digest(body.username.strip(), expected_username)
+    password_ok = hmac.compare_digest(body.password, expected_password)
+    if not username_ok or not password_ok:
         raise HTTPException(status_code=401, detail="Incorrect username or password")
 
-    expires_at_dt = dt.datetime.now(dt.timezone.utc) + dt.timedelta(hours=12)
+    # Fix #5: issue a properly signed JWT (was an unverifiable random string)
+    from auty.auth import create_jwt as _create_jwt
+    _local_tenant_id = uuid.UUID(int=0)
+    token, expires_at_dt = _create_jwt(_local_tenant_id, expected_username)
     expires_at = expires_at_dt.isoformat().replace("+00:00", "Z")
-    nonce = base64.urlsafe_b64encode(os.urandom(24)).decode().rstrip("=")
-    token = f"local_{expected_username}_{nonce}"
     return LoginResponse(token=token, expires_at=expires_at)
 
 
@@ -575,7 +620,7 @@ def get_alerts():
 
 
 @app.get("/api/profiles", response_model=list[ProfileOut])
-def list_profiles(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def list_profiles(tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     if tenant_id is not None:
         from auty.db import repositories as repo
 
@@ -605,7 +650,7 @@ def list_profiles(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
 @app.delete("/api/profiles/{profile_id}")
 def delete_profile(
     profile_id: str,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     if tenant_id is not None:
         from auty.db import repositories as repo
@@ -660,6 +705,9 @@ async def recognize_frame(
     """
     eng = require_engine()
     jpeg_bytes = await file.read()
+    # Fix #9: reject oversized uploads before decoding to prevent OOM DoS
+    if len(jpeg_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large")
     face_db = None
     if tenant_id is not None:
         db = _open_db()
@@ -676,7 +724,7 @@ async def recognize_frame(
 
 
 @app.post("/api/profiles/reset-all")
-def reset_all_profiles(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def reset_all_profiles(tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     """Delete every identity record, face embedding, and profile. Cannot be undone."""
     eng = require_engine()
 
@@ -771,7 +819,7 @@ def enrollment_cancel():
 
 
 @app.get("/api/profiles/{name}")
-def get_profile(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def get_profile(name: str, tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     if tenant_id is not None:
         from auty.db import repositories as repo
 
@@ -803,8 +851,23 @@ def get_profile(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_ten
     )
 
 
+def _safe_photo_response(path: str) -> "FileResponse":
+    """Fix #16: resolve path and verify it lives inside DATA_DIR before serving."""
+    from utils.paths import DATA_DIR as _DATA_DIR
+
+    try:
+        resolved = Path(path).resolve()
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if not resolved.is_relative_to(_DATA_DIR):
+        raise HTTPException(status_code=404, detail="Photo not found")
+    if not resolved.is_file():
+        raise HTTPException(status_code=404, detail="Photo not found")
+    return FileResponse(str(resolved), media_type="image/jpeg")
+
+
 @app.get("/api/profiles/{name}/photo")
-def profile_photo(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def profile_photo(name: str, tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     if tenant_id is not None:
         from auty.db import repositories as repo
 
@@ -816,18 +879,16 @@ def profile_photo(name: str, tenant_id: Optional[uuid.UUID] = Depends(optional_t
             path = row.photo_path
         finally:
             db.close()
-        if not os.path.isfile(path):
-            raise HTTPException(status_code=404, detail="Photo not found")
-        return FileResponse(path, media_type="image/jpeg")
+        return _safe_photo_response(path)
 
     eng = require_engine()
     p = eng.db.get_profile(name)
     if not p:
         raise HTTPException(status_code=404, detail="Profile not found")
     path = p.get("image")
-    if not path or not os.path.isfile(path):
+    if not path:
         raise HTTPException(status_code=404, detail="Photo not found")
-    return FileResponse(path, media_type="image/jpeg")
+    return _safe_photo_response(path)
 
 
 def _classify_save_error(msg: str) -> str:
@@ -921,7 +982,7 @@ def _validate_enrollment_images(images: list) -> Optional[dict]:
 @app.post("/api/profiles")
 def create_profile(
     body: ProfileCreate,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     eng = require_engine()
 
@@ -1016,6 +1077,9 @@ def check_enrollment_frame(body: FrameCheckRequest):
         payload = body.image_b64.strip()
         if "," in payload and payload.startswith("data:"):
             payload = payload.split(",", 1)[1]
+        # Fix #9: check estimated decoded size before allocating
+        if len(payload) * 3 // 4 > MAX_IMAGE_BYTES:
+            return FrameCheckOut(face_detected=False, message="image_too_large")
         raw = base64.b64decode(payload)
         arr = np.frombuffer(raw, dtype=np.uint8)
         frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -1170,7 +1234,7 @@ def _status_alert(status: str, name: str, minutes: int, shift_start: Optional[st
 @app.get("/api/schedules/{employee_id}", response_model=WeeklyScheduleOut)
 def get_schedule(
     employee_id: str,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     if tenant_id is not None:
         from auty.db import repositories as repo
@@ -1194,7 +1258,7 @@ def get_schedule(
 def save_schedule(
     employee_id: str,
     body: WeeklyScheduleIn,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     data = body.model_dump()
     data["employee_id"] = employee_id
@@ -1219,7 +1283,7 @@ def save_schedule(
 # ---------------------------------------------------------------------------
 
 @app.get("/api/attendance/active")
-def get_attendance_active(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def get_attendance_active(tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     """Who is clocked in right now."""
     if tenant_id is not None:
         from auty.db import repositories as repo
@@ -1241,7 +1305,7 @@ def get_attendance_active(tenant_id: Optional[uuid.UUID] = Depends(optional_tena
 
 @app.get("/api/attendance/status/today", response_model=TodayAttendanceStatusOut)
 def get_today_attendance_status(
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     """Every employee's schedule-aware attendance status for today."""
     eng = require_engine()
@@ -1356,7 +1420,7 @@ def get_attendance_events(
     end_date: Optional[str] = None,
     employee: Optional[str] = None,
     location_id: Optional[str] = None,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     """Filterable attendance event log."""
     start_ts: Optional[float] = None
@@ -1410,7 +1474,7 @@ def get_attendance_events(
 @app.post("/api/attendance/notes")
 def add_attendance_note(
     body: AttendanceNoteCreate,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     """Add a manager note to an event (never modifies the original record)."""
     if tenant_id is not None:
@@ -1443,7 +1507,7 @@ def preview_export(
     start_date: str = "",
     end_date: str = "",
     location_id: Optional[str] = None,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     eng = require_engine()
     tz_name = str(eng.settings.get("timezone", "UTC"))
@@ -1471,7 +1535,7 @@ def preview_export(
 @app.post("/api/attendance/export")
 def export_attendance(
     body: ExportRequest,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     """Generate a payroll CSV for download."""
     eng = require_engine()
@@ -1524,7 +1588,12 @@ def export_attendance(
                 detail=f"{body.format} {body.start_date}–{body.end_date}",
             )
 
-    filename = f"attendance_{body.format}_{body.start_date}_{body.end_date}.csv"
+    # Fix #12: sanitize user-supplied fields before embedding in the HTTP header
+    filename = (
+        f"attendance_{_safe_filename_part(body.format)}"
+        f"_{_safe_filename_part(body.start_date)}"
+        f"_{_safe_filename_part(body.end_date)}.csv"
+    )
     return StreamingResponse(
         io.BytesIO(csv_content.encode("utf-8")),
         media_type="text/csv",
@@ -1610,7 +1679,7 @@ def get_consent_status(
 async def request_data_deletion(
     employee_id: str,
     request: Request,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     eng = require_engine()
 
@@ -1646,9 +1715,11 @@ async def request_data_deletion(
 @app.get("/api/audit")
 def get_audit_log_api(
     limit: int = 50,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     """Return the last N audit log entries."""
+    # Fix #11: cap to prevent memory exhaustion on the file-based path
+    limit = max(1, min(limit, 500))
     if tenant_id is not None:
         from auty.db import repositories as repo
 
@@ -1668,7 +1739,7 @@ def get_audit_log_api(
 
 
 @app.get("/api/settings")
-def get_settings(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
+def get_settings(tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     base = load_settings()
     eng = vision_ref()
     if eng is not None:
@@ -1682,15 +1753,19 @@ def get_settings(tenant_id: Optional[uuid.UUID] = Depends(optional_tenant)):
             tenant_settings = repo.get_settings_dict(db, tenant_id)
         finally:
             db.close()
-        return {**base, **tenant_settings}
+        result = {**base, **tenant_settings}
+    else:
+        result = base
 
-    return base
+    # Fix #4: never expose the kiosk PIN over the API — verify it server-side
+    result.pop("kiosk_pin", None)
+    return result
 
 
 @app.patch("/api/settings")
 def patch_settings(
     body: SettingsPatch,
-    tenant_id: Optional[uuid.UUID] = Depends(optional_tenant),
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
 ):
     eng = require_engine()
     _extra_allowed = {

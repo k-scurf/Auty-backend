@@ -228,4 +228,10 @@ def load_settings() -> dict:
     det_env = os.environ.get("AUTY_INSIGHTFACE_DET_SIZE")
     if det_env:
         merged["insightface_det_size"] = int(det_env)
+    # Fix #14: warn loudly about default credentials so operators notice
+    if str(merged.get("kiosk_pin", "")) == "1234":
+        print(
+            "[Auty] WARNING: kiosk_pin is the default '1234'. "
+            "Change it via PATCH /api/settings before deploying."
+        )
     return merged
