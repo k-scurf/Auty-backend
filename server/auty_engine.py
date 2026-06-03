@@ -584,6 +584,16 @@ class VisionEngine:
         if frame is None or frame.size == 0:
             return self.get_snapshot()
 
+        # Downscale to pipeline resolution before any processing.  iPad frames
+        # can be 1280×720 or larger; running CLAHE and SCRFD detection at full
+        # resolution is the main cause of slow inference on CPU.  Only shrink —
+        # never upscale a frame that's already smaller than the target.
+        fh, fw = frame.shape[:2]
+        if fw > PROCESS_W or fh > PROCESS_H:
+            frame = cv2.resize(
+                frame, (PROCESS_W, PROCESS_H), interpolation=cv2.INTER_LINEAR
+            )
+
         # Normalise lighting before detection so CLAHE runs on the full raw frame.
         from auty.vision.preprocessing import normalize_lighting
         frame = normalize_lighting(frame)
