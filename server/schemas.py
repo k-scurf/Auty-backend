@@ -291,5 +291,10 @@ class FrameCheckOut(BaseModel):
     message: str = ""
 
 
+class AddPhotosRequest(BaseModel):
+    # 1–5 base64-encoded JPEG images to add as extra embeddings for an existing employee.
+    images: List[str]
+
+
 class SettingsPatch(BaseModel):
     settings: Dict[str, Any]

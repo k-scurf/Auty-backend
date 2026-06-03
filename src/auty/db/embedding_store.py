@@ -59,6 +59,52 @@ def save_embeddings(
     invalidate_tenant_gallery(tenant_id)
 
 
+def append_embeddings(
+    db: Session,
+    employee_id: uuid.UUID,
+    tenant_id: uuid.UUID,
+    new_embeddings: List[np.ndarray],
+    max_total: int = 5,
+) -> int:
+    """Add embeddings for an employee without replacing existing ones.
+
+    Inserts rows up to *max_total* total for this employee and returns the
+    number actually added.  Call invalidate_tenant_gallery after if you need
+    the in-memory cache refreshed immediately (this function does it too).
+    """
+    from sqlalchemy import func
+
+    existing_count = (
+        db.execute(
+            select(func.count()).select_from(Embedding).where(
+                Embedding.tenant_id == tenant_id,
+                Embedding.employee_id == employee_id,
+            )
+        ).scalar()
+        or 0
+    )
+
+    added = 0
+    for arr in new_embeddings:
+        if existing_count + added >= max_total:
+            break
+        if arr is None or np.asarray(arr).size == 0:
+            continue
+        db.add(
+            Embedding(
+                tenant_id=tenant_id,
+                employee_id=employee_id,
+                embedding=serialize_embedding(np.asarray(arr, dtype=np.float32)),
+            )
+        )
+        added += 1
+
+    if added:
+        db.commit()
+        invalidate_tenant_gallery(tenant_id)
+    return added
+
+
 def delete_tenant_embeddings(db: Session, tenant_id: uuid.UUID) -> int:
     """Delete embedding rows for a tenant (employees may remain)."""
     result = db.execute(delete(Embedding).where(Embedding.tenant_id == tenant_id))

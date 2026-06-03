@@ -96,7 +96,9 @@ def match_identity_detailed(
 
     retain_th = float(get_cfg("lock_retain_threshold", 0.40))
     release_th = float(get_cfg("lock_release_threshold", 0.32))
-    global_th = float(get_cfg("confidence_threshold", 0.48))
+    # confidence_threshold: minimum cosine similarity to accept a match.
+    # Tune via settings — see DEFAULT_SETTINGS in settings_loader.py.
+    global_th = float(get_cfg("confidence_threshold", 0.35))
     min_margin = float(get_cfg("score_margin", 0.06))
     person_th = gal.thresholds.get(best_name, global_th)
 

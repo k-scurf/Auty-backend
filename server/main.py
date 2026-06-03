@@ -40,6 +40,7 @@ from fastapi.staticfiles import StaticFiles
 from camera import local_camera_enabled
 from server.auty_engine import VisionEngine, get_engine
 from server.schemas import (
+    AddPhotosRequest,
     AttendanceEventOut,
     AttendanceNoteCreate,
     AttendanceStatusOut,
@@ -691,6 +692,120 @@ def delete_profile(
         eng.db.delete_profile(name=profile_id)
         return {"ok": True}
     raise HTTPException(status_code=404, detail="Profile not found")
+
+
+@app.post("/api/profiles/{profile_id}/photos")
+def add_profile_photos(
+    profile_id: str,
+    body: AddPhotosRequest,
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
+):
+    """Add up to 5 face-embedding photos to an existing employee profile.
+
+    Appends new embeddings without replacing existing ones.  The total is
+    capped at 5 so employees can be enrolled from multiple lighting conditions.
+    """
+    MAX_PER_EMPLOYEE = 5
+
+    if not body.images:
+        raise HTTPException(
+            status_code=422,
+            detail={"code": "INVALID_INPUT", "message": "At least one photo is required."},
+        )
+    if len(body.images) > MAX_PER_EMPLOYEE:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "INVALID_INPUT",
+                "message": f"Maximum {MAX_PER_EMPLOYEE} photos per request.",
+            },
+        )
+
+    validation_err = _validate_enrollment_images(body.images)
+    if validation_err:
+        raise HTTPException(status_code=422, detail=validation_err)
+
+    import recognition as rec
+
+    if tenant_id is not None:
+        from auty.db import repositories as repo
+        from auty.db.embedding_store import append_embeddings
+
+        db = _open_db()
+        try:
+            try:
+                eid = uuid.UUID(profile_id)
+            except ValueError:
+                eid = None
+
+            employee = None
+            if eid is not None:
+                employee = repo.get_employee_by_id(db, tenant_id, eid)
+            if employee is None:
+                employee = repo.get_employee_by_name(db, tenant_id, profile_id)
+            if employee is None:
+                raise HTTPException(status_code=404, detail="Profile not found")
+
+            new_embeddings: list = []
+            for img_b64 in body.images:
+                frame = _decode_b64_image(img_b64)
+                if frame is None:
+                    continue
+                new_embeddings.extend(rec.extract_embeddings_robust(frame))
+
+            if not new_embeddings:
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "code": "NO_FACE_DETECTED",
+                        "message": "Could not extract face embeddings from the submitted photos.",
+                    },
+                )
+
+            added = append_embeddings(db, employee.id, tenant_id, new_embeddings, max_total=MAX_PER_EMPLOYEE)
+            return {"ok": True, "added": added}
+        finally:
+            db.close()
+
+    # In-memory (non-postgres) path
+    eng = require_engine()
+    prof = eng.db.get_profile_by_id(profile_id) or eng.db.get_profile(profile_id)
+    if prof is None:
+        raise HTTPException(status_code=404, detail="Profile not found")
+    name = prof.get("name", profile_id)
+
+    existing_count = len(eng.db.face_db.get(name, []))
+    slots = max(0, MAX_PER_EMPLOYEE - existing_count)
+    if slots == 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "MAX_EMBEDDINGS",
+                "message": f"Maximum of {MAX_PER_EMPLOYEE} photos already enrolled for this employee.",
+            },
+        )
+
+    added = 0
+    for img_b64 in body.images:
+        if added >= slots:
+            break
+        frame = _decode_b64_image(img_b64)
+        if frame is None:
+            continue
+        for emb in rec.extract_embeddings_robust(frame):
+            if added >= slots:
+                break
+            eng.db.add_embedding(name, emb)
+            added += 1
+
+    if added:
+        eng.db.face_db = eng.db.store.build_face_db()
+        eng.db.save()
+        from vision.matcher import sync_gallery
+
+        sync_gallery(eng.db.face_db, eng.db.store)
+
+    return {"ok": True, "added": added}
 
 
 @app.post("/api/recognize-frame", response_model=FrameSnapshotOut)

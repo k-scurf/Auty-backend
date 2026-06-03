@@ -164,7 +164,7 @@ export function KioskPage() {
   const [kioskState, setKioskState] = useState<KioskEvent>({ state: "idle" });
   const [statusHint, setStatusHint] = useState("Starting up…");
   const imgSrc = useFrameJpeg();
-  const { videoRef, error: cameraError, active: cameraActive } = useDeviceCamera(USE_DEVICE_CAMERA, "front");
+  const { videoRef, error: cameraError, active: cameraActive, tooDark } = useDeviceCamera(USE_DEVICE_CAMERA, "front");
   const [showPin, setShowPin] = useState(false);
   const [, setTapCount] = useState(0);
   const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -467,14 +467,23 @@ export function KioskPage() {
                 <p className="text-sm text-danger">{cameraError}</p>
               </div>
             ) : (
-              <video
-                ref={videoRef}
-                autoPlay
-                playsInline
-                muted
-                className="h-full w-full object-cover"
-                style={{ transform: "scaleX(-1)" /* mirror front camera */}}
-              />
+              <>
+                <video
+                  ref={videoRef}
+                  autoPlay
+                  playsInline
+                  muted
+                  className="h-full w-full object-cover"
+                  style={{ transform: "scaleX(-1)" /* mirror front camera */}}
+                />
+                {cameraActive && tooDark && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-black/65 z-10">
+                    <p className="text-white text-lg font-semibold text-center px-6 leading-snug">
+                      Too dark — move to better lighting
+                    </p>
+                  </div>
+                )}
+              </>
             )
           ) : (
             <img

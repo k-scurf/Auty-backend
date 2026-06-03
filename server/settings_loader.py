@@ -119,8 +119,15 @@ DEFAULT_SETTINGS = {
     "hud_scan_line": False,
     "hud_unknown_auto_snapshot": False,
     "hud_unknown_snapshot_interval": 30,
-    "confidence_threshold": 0.48,
-    "min_lock_score": 0.62,
+    # Minimum cosine similarity (0–1) required to accept a face match.
+    # Higher = stricter (fewer false accepts); lower = more lenient (better
+    # in dim / challenging lighting but higher false-positive risk).
+    # Raise toward 0.55 if you see wrong-person matches; lower toward 0.30
+    # if staff are frequently unrecognised in normal conditions.
+    "confidence_threshold": 0.35,
+    # Secondary score floor applied on the kiosk recognition path.
+    # Must be >= confidence_threshold; keeps a margin above the main gate.
+    "min_lock_score": 0.40,
     "recognition_streak": 2,
     "score_margin": 0.06,
     "recognition_misses": 4,
@@ -166,7 +173,7 @@ DEFAULT_SETTINGS = {
     "kiosk_fast_checkin": True,
     "presence_out_timeout_seconds": 180,
     "presence_checkin_cooldown_seconds": 600,
-    "presence_min_lock_score": 0.62,
+    "presence_min_lock_score": 0.40,
     "presence_use_confirm_frames_for_filter": True,
     "presence_confidence_history_size": 20,
     "presence_sessions_file": "presence_sessions.json",
