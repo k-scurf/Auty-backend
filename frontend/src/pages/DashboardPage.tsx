@@ -1,9 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useSearchParams } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
-import { LiveFeed } from "../components/dashboard/LiveFeed";
-import { ProfileCard } from "../components/dashboard/ProfileCard";
-import { StatusPills } from "../components/dashboard/StatusPills";
 import { EnrollModal } from "../components/dashboard/EnrollModal";
 import { EnrollmentWizard } from "../components/dashboard/EnrollmentWizard";
 import { ExportPanel } from "../components/dashboard/ExportPanel";
@@ -15,7 +12,6 @@ import { TimeDisplay } from "../components/ui/TimeDisplay";
 import { AlertBanner } from "../components/ui/AlertBanner";
 import { Skeleton } from "../components/ui/Skeleton";
 import { useFrameContext } from "../context/FrameContext";
-import { usePrimaryTrack } from "../hooks/usePrimaryTrack";
 import { useSystemStatus } from "../hooks/useSystemStatus";
 import {
   fetchSettings,
@@ -72,7 +68,6 @@ function LiveTab({
   engineReady: boolean;
 }) {
   const { frame } = useFrameContext();
-  const primary = usePrimaryTrack(frame);
   const [enrollDismissed, setEnrollDismissed] = useState(false);
   const [guidedEnroll, setGuidedEnroll] = useState(true);
 
@@ -107,66 +102,54 @@ function LiveTab({
         <AlertBanner key={i} variant="warning" message={`${a.name} — ${a.detail}`} />
       ))}
 
-      <div className="grid gap-6 lg:grid-cols-[1fr_300px]">
-        {/* Camera + status */}
-        <div className="space-y-4">
-          <StatusPills fsmState={frame?.fsm_state ?? "IDLE"} />
-          <LiveFeed frame={frame} />
-          <p className="text-sm text-text-muted">
-            {guidedCapturing
-              ? progress?.instruction || "Capturing enrollment photos…"
-              : frame?.status_line || "Waiting for camera…"}
-          </p>
-          {/* Last event */}
-          {attendance && attendance.recent_events.length > 0 && (() => {
-            const ev = attendance.recent_events[0];
-            return (
-              <div className="card flex items-center gap-3 p-3">
-                <EmployeeAvatar name={ev.name} size="lg" status={ev.event === "CLOCK_IN" ? "in" : "out"} />
-                <div>
-                  <div className="font-semibold text-text-primary text-sm">{ev.name}</div>
-                  <div className="text-xs text-text-secondary">
-                    {ev.event === "CLOCK_IN" ? "Clocked in" : "Clocked out"} at{" "}
-                    <TimeDisplay ts={ev.timestamp_ts * 1000} variant="time" />
-                  </div>
-                </div>
+      {/* Last event */}
+      {attendance && attendance.recent_events.length > 0 && (() => {
+        const ev = attendance.recent_events[0];
+        return (
+          <div className="card flex items-center gap-3 p-3">
+            <EmployeeAvatar name={ev.name} size="lg" status={ev.event === "CLOCK_IN" ? "in" : "out"} />
+            <div>
+              <div className="font-semibold text-text-primary text-sm">{ev.name}</div>
+              <div className="text-xs text-text-secondary">
+                {ev.event === "CLOCK_IN" ? "Clocked in" : "Clocked out"} at{" "}
+                <TimeDisplay ts={ev.timestamp_ts * 1000} variant="time" />
               </div>
-            );
-          })()}
-        </div>
+            </div>
+          </div>
+        );
+      })()}
 
-        {/* Who's in now */}
-        <div className="card p-4 space-y-3">
-          <h3 className="text-sm font-semibold text-text-primary">Who's In Now</h3>
-          {!attendance ? (
-            <div className="space-y-2">
-              <Skeleton className="h-8" />
-              <Skeleton className="h-8" />
-              <Skeleton className="h-8" />
-            </div>
-          ) : attendance.clocked_in.length === 0 ? (
-            <div className="flex flex-col items-center gap-2 py-6 text-center">
-              <div className="text-2xl">🏢</div>
-              <p className="text-xs text-text-muted">No one clocked in yet</p>
-            </div>
-          ) : (
-            <ul className="space-y-1">
-              {attendance.clocked_in.map((e) => (
-                <li
-                  key={e.employee_id}
-                  className="flex items-center gap-2.5 rounded-md border-l-[3px] border-accent bg-bg-elevated px-3 py-2"
-                >
-                  <EmployeeAvatar name={e.name} size="sm" status="in" />
-                  <div className="flex-1 min-w-0">
-                    <div className="text-xs font-medium text-text-primary truncate">{e.name}</div>
-                    <div className="text-[10px] text-text-muted">In since {fmtTime(e.clock_in_ts)}</div>
-                  </div>
-                  <span className="font-mono text-[10px] text-accent">{fmtDuration(e.duration_seconds)}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </div>
+      {/* Who's in now */}
+      <div className="card p-4 space-y-3">
+        <h3 className="text-sm font-semibold text-text-primary">Who's In Now</h3>
+        {!attendance ? (
+          <div className="space-y-2">
+            <Skeleton className="h-8" />
+            <Skeleton className="h-8" />
+            <Skeleton className="h-8" />
+          </div>
+        ) : attendance.clocked_in.length === 0 ? (
+          <div className="flex flex-col items-center gap-2 py-6 text-center">
+            <div className="text-2xl">🏢</div>
+            <p className="text-xs text-text-muted">No one clocked in yet</p>
+          </div>
+        ) : (
+          <ul className="space-y-1">
+            {attendance.clocked_in.map((e) => (
+              <li
+                key={e.employee_id}
+                className="flex items-center gap-2.5 rounded-md border-l-[3px] border-accent bg-bg-elevated px-3 py-2"
+              >
+                <EmployeeAvatar name={e.name} size="sm" status="in" />
+                <div className="flex-1 min-w-0">
+                  <div className="text-xs font-medium text-text-primary truncate">{e.name}</div>
+                  <div className="text-[10px] text-text-muted">In since {fmtTime(e.clock_in_ts)}</div>
+                </div>
+                <span className="font-mono text-[10px] text-accent">{fmtDuration(e.duration_seconds)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
       {/* Enrollment modals */}
@@ -182,7 +165,6 @@ function LiveTab({
           onDone={() => setEnrollDismissed(true)}
         />
       )}
-      {primary && <ProfileCard track={primary} statusLine={frame?.status_line ?? ""} />}
     </div>
   );
 }
