@@ -584,6 +584,10 @@ class VisionEngine:
         if frame is None or frame.size == 0:
             return self.get_snapshot()
 
+        # Normalise lighting before detection so CLAHE runs on the full raw frame.
+        from auty.vision.preprocessing import normalize_lighting
+        frame = normalize_lighting(frame)
+
         # Resize to pipeline resolution to match enrollment embeddings
         from vision.preprocess import preprocess_frame
         frame = preprocess_frame(frame)
@@ -1206,6 +1210,10 @@ class VisionEngine:
             now = time.time()
             if now - float(self._enrollment.get("last_capture_ts", 0)) < 0.12:
                 return
+
+            # Normalise lighting on the raw camera frame before detection.
+            from auty.vision.preprocessing import normalize_lighting
+            frame = normalize_lighting(frame)
 
             try:
                 detections = face_detection.detect_faces(

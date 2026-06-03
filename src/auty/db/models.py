@@ -64,7 +64,10 @@ class Employee(Base):
     )
 
     tenant: Mapped["Tenant"] = relationship(back_populates="employees")
-    embeddings: Mapped[list["Embedding"]] = relationship(back_populates="employee")
+    embeddings: Mapped[list["Embedding"]] = relationship(
+        back_populates="employee",
+        passive_deletes=True,
+    )
 
 
 class Embedding(Base):
