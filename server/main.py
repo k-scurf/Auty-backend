@@ -949,7 +949,10 @@ async def enrollment_frame(file: UploadFile = File(...)):
 
 
 @app.post("/api/enrollment/rename")
-def enrollment_rename(body: dict):
+def enrollment_rename(
+    body: dict,
+    tenant_id: Optional[uuid.UUID] = Depends(require_tenant),
+):
     """Rename the auto-committed provisional identity (e.g. 'Guest_3f2a')
     from the guided pose-capture flow to the real employee name."""
     new_name = str(body.get("name", "")).strip()
@@ -966,6 +969,39 @@ def enrollment_rename(body: dict):
     if not eng.db.rename_profile(old_name, new_name):
         raise HTTPException(status_code=400, detail={"code": "RENAME_FAILED", "message": "Could not rename profile."})
     eng._enrollment["provisional_name"] = new_name
+
+    # The provisional identity was only ever written to the file-based store
+    # (commit_provisional_enrollment doesn't know about tenants). Without this,
+    # a tenant-scoped deployment recognises the person and logs attendance
+    # under their name, but /api/profiles (which reads from Postgres for
+    # tenants) never sees them — same sync the manual enrollment path does.
+    if tenant_id is not None:
+        prof = eng.db.get_profile(new_name) or {}
+        image_path = prof.get("image")
+        if image_path:
+            from auty.db.repositories import tenant_photos_dir
+
+            photos = tenant_photos_dir(tenant_id)
+            identity = eng.db.store.find_by_name(new_name)
+            fname = f"{identity.id if identity else new_name}.jpg"
+            dest = photos / fname
+            try:
+                if os.path.isfile(image_path):
+                    import shutil
+
+                    shutil.copy2(image_path, dest)
+                    image_path = str(dest)
+            except OSError:
+                pass
+        _sync_profile_to_db(
+            tenant_id,
+            new_name,
+            prof.get("age", ""),
+            prof.get("status", "FRIEND"),
+            image_path=image_path,
+        )
+        eng.persist_embeddings_to_postgres(tenant_id, new_name)
+
     return {"ok": True, "name": new_name}
 
 
