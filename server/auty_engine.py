@@ -575,7 +575,7 @@ class VisionEngine:
         same shape of data as the WebSocket broadcast.
         """
         import recognition as rec
-        from vision.detector import detect as detect_faces
+        import face_detection
         from vision.matcher import match_identity
 
         # Decode JPEG → numpy BGR
@@ -584,31 +584,29 @@ class VisionEngine:
         if frame is None or frame.size == 0:
             return self.get_snapshot()
 
-        # Downscale to pipeline resolution before any processing.  iPad frames
-        # can be 1280×720 or larger; running CLAHE and SCRFD detection at full
-        # resolution is the main cause of slow inference on CPU.  Only shrink —
-        # never upscale a frame that's already smaller than the target.
+        # Downscale to pipeline resolution — only shrink, never upscale.
         fh, fw = frame.shape[:2]
         if fw > PROCESS_W or fh > PROCESS_H:
-            frame = cv2.resize(
-                frame, (PROCESS_W, PROCESS_H), interpolation=cv2.INTER_LINEAR
-            )
+            scale = min(PROCESS_W / fw, PROCESS_H / fh)
+            frame = cv2.resize(frame, (int(fw * scale), int(fh * scale)), interpolation=cv2.INTER_AREA)
 
-        # Normalise lighting before detection so CLAHE runs on the full raw frame.
+        # Normalise lighting before detection.
         from auty.vision.preprocessing import normalize_lighting
         frame = normalize_lighting(frame)
 
-        # Resize to pipeline resolution to match enrollment embeddings
-        from vision.preprocess import preprocess_frame
-        frame = preprocess_frame(frame)
-
-        faces = detect_faces(frame, max_faces=1)
-        if not faces:
+        # Use same detection path as enrollment so thresholds match.
+        raw = face_detection.detect_faces(frame, self.face_cascade, self.settings)
+        print(f"[client-cam] frame={frame.shape} faces={len(raw)}")
+        if not raw:
             return self.get_snapshot()
 
+        # Convert to the shape that align_face expects.
+        det = max(raw, key=lambda d: d["bbox"][2] * d["bbox"][3])
+        faces = [det]
+
         best = faces[0]
-        x, y, w, h = best.bbox
-        aligned = rec.align_face(frame, x, y, w, h, kps=best.kps)
+        x, y, w, h = best["bbox"]
+        aligned = rec.align_face(frame, x, y, w, h, kps=best.get("kps"))
         if aligned is None or aligned.size == 0:
             return self.get_snapshot()
 
@@ -622,6 +620,7 @@ class VisionEngine:
         ))
         gallery = face_db if face_db is not None else self._resolve_face_db()
         name, score, _second, _dist = match_identity(gallery, embedding)
+        print(f"[client-cam] match={name!r} score={score:.3f} threshold={min_score:.3f}")
         if not name or name == "UNKNOWN" or score < min_score:
             return self.get_snapshot()
 
@@ -1234,6 +1233,7 @@ class VisionEngine:
                 return
 
             if not detections:
+                self.enrollment_session.mark_no_face()
                 return
 
             det = max(
@@ -1259,8 +1259,29 @@ class VisionEngine:
             elif reason and self.enrollment_session.tick_count % 20 == 0:
                 print(f"[Auty] Enrollment: {reason}")
 
-        if self.enrollment_session.active:
-            self._maybe_commit_provisional()
+        # Do NOT auto-commit here — guided enrollment only commits when the
+        # user explicitly enters their name in the UI (commit_provisional_enrollment).
+
+    def submit_enrollment_frame(self, jpeg_bytes: bytes) -> None:
+        """Feed a client-camera (e.g. iPad) JPEG into guided enrollment.
+
+        Counterpart to recognize_client_frame: when the server has no local
+        webcam pointed at the kiosk (use_local_camera=false, or the operator
+        is testing from a phone/tablet's own camera), enrollment capture
+        would otherwise see nothing — _guided_enrollment_capture_direct only
+        ever read from the server's own self.camera_stream.
+        """
+        buf = np.frombuffer(jpeg_bytes, np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame is None or frame.size == 0:
+            return
+        fh, fw = frame.shape[:2]
+        if fw > PROCESS_W or fh > PROCESS_H:
+            scale = min(PROCESS_W / fw, PROCESS_H / fh)
+            frame = cv2.resize(
+                frame, (int(fw * scale), int(fh * scale)), interpolation=cv2.INTER_AREA
+            )
+        self._guided_enrollment_capture_direct(frame)
 
     def cancel_guided_enrollment(self):
         self.enrollment_session.cancel()
@@ -1305,6 +1326,7 @@ class VisionEngine:
                 embeddings,
                 image_path=image_rel,
                 poses=self.enrollment_session.poses(),
+                pose_angles=self.enrollment_session.pose_angles(),
                 profile=profile,
             )
             profile["id"] = rec_meta.id
@@ -1565,7 +1587,6 @@ class VisionEngine:
                         if accepted:
                             n = len(self.enrollment_session.samples)
                             print(f"[Auty] Enrollment sample {n}")
-                    self._maybe_commit_provisional()
         self._maybe_auto_start_enrollment(visible)
         visible_ids = {t["id"] for t in visible}
         self._emit_track_lifecycle(visible_ids)

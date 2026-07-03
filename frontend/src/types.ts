@@ -53,6 +53,13 @@ export interface EnrollmentProgress {
   phase_counts?: Record<string, number>;
   phase_targets?: Record<string, number>;
   phases?: string[];
+  // Backend pose-guide stability state (vision/enrollment_pose_guide.py)
+  pose_target?: string | null;
+  stability_progress?: number;
+  ready_to_capture?: boolean;
+  // Reason-specific guidance — what's blocking capture right now, if anything
+  live_message?: string;
+  face_visible?: boolean;
 }
 
 // ---------------------------------------------------------------------------

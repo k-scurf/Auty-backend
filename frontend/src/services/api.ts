@@ -103,6 +103,11 @@ export async function fetchEnrollmentStatus(): Promise<import("../types").Enroll
   return data;
 }
 
+export async function renameProvisionalEnrollment(name: string): Promise<{ ok: boolean; name: string }> {
+  const { data } = await api.post("/api/enrollment/rename", { name });
+  return data;
+}
+
 export function profilePhotoUrl(name: string): string {
   return `${baseURL}/api/profiles/${encodeURIComponent(name)}/photo`;
 }

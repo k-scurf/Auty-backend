@@ -29,7 +29,8 @@ export interface DeviceCameraState {
 
 export function useDeviceCamera(
   enabled: boolean,
-  preference: "front" | "back" | "auto" = "front"
+  preference: "front" | "back" | "auto" = "front",
+  endpoint: string = "/api/recognize-frame"
 ): DeviceCameraState {
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -93,7 +94,7 @@ export function useDeviceCamera(
         const form = new FormData();
         form.append("file", blob, "frame.jpg");
         try {
-          await api.post("/api/recognize-frame", form, {
+          await api.post(endpoint, form, {
             headers: { "Content-Type": "multipart/form-data" },
           });
         } catch {
@@ -103,7 +104,7 @@ export function useDeviceCamera(
       "image/jpeg",
       JPEG_QUALITY
     );
-  }, []);
+  }, [endpoint]);
 
   useEffect(() => {
     if (!enabled) {

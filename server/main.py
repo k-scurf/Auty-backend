@@ -933,6 +933,42 @@ def enrollment_cancel():
     return {"ok": True}
 
 
+@app.post("/api/enrollment/frame")
+async def enrollment_frame(file: UploadFile = File(...)):
+    """Accept a JPEG from a client device camera (e.g. iPad) and feed it into
+    guided enrollment capture — the enrollment counterpart to
+    /api/recognize-frame, for setups with no local webcam on the server."""
+    eng = require_engine()
+    jpeg_bytes = await file.read()
+    if len(jpeg_bytes) > MAX_IMAGE_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large")
+    import asyncio
+
+    await asyncio.to_thread(eng.submit_enrollment_frame, jpeg_bytes)
+    return {"ok": True}
+
+
+@app.post("/api/enrollment/rename")
+def enrollment_rename(body: dict):
+    """Rename the auto-committed provisional identity (e.g. 'Guest_3f2a')
+    from the guided pose-capture flow to the real employee name."""
+    new_name = str(body.get("name", "")).strip()
+    if not new_name:
+        raise HTTPException(status_code=422, detail={"code": "INVALID_INPUT", "message": "Name is required."})
+    eng = require_engine()
+    # Commit the provisional enrollment now if it hasn't been committed yet
+    # (guided flow no longer auto-commits during frame capture).
+    if not eng._enrollment.get("provisional_name") and eng.enrollment_session.active:
+        eng.commit_provisional_enrollment()
+    old_name = eng._enrollment.get("provisional_name")
+    if not old_name:
+        raise HTTPException(status_code=409, detail={"code": "NO_PROVISIONAL", "message": "No provisional enrollment to rename."})
+    if not eng.db.rename_profile(old_name, new_name):
+        raise HTTPException(status_code=400, detail={"code": "RENAME_FAILED", "message": "Could not rename profile."})
+    eng._enrollment["provisional_name"] = new_name
+    return {"ok": True, "name": new_name}
+
+
 @app.get("/api/profiles/{name}")
 def get_profile(name: str, tenant_id: Optional[uuid.UUID] = Depends(require_tenant)):
     if tenant_id is not None:

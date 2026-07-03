@@ -48,6 +48,17 @@ function AlertIcon() {
     </svg>
   );
 }
+function ScheduleIcon() {
+  return (
+    <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
+      <rect x="1" y="3" width="16" height="14" rx="2" stroke="currentColor" strokeWidth="1.5" />
+      <line x1="1" y1="7" x2="17" y2="7" stroke="currentColor" strokeWidth="1.5" />
+      <line x1="5" y1="1" x2="5" y2="5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <line x1="13" y1="1" x2="13" y2="5" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+      <line x1="5" y1="11" x2="13" y2="11" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+    </svg>
+  );
+}
 function SettingsIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
@@ -72,8 +83,9 @@ function KioskIcon() {
 const LINKS: NavItem[] = [
   { to: "/",        label: "Dashboard",    end: true, icon: <DashIcon /> },
   { to: "/logs",    label: "Attendance",   icon: <LogsIcon /> },
-  { to: "/profiles",label: "Employees",    icon: <UsersIcon /> },
-  { to: "/alerts",  label: "Alerts",       icon: <AlertIcon /> },
+  { to: "/profiles",  label: "Employees",  icon: <UsersIcon /> },
+  { to: "/schedules", label: "Schedules",  icon: <ScheduleIcon /> },
+  { to: "/alerts",    label: "Alerts",     icon: <AlertIcon /> },
   { to: "/settings",label: "Settings",     icon: <SettingsIcon /> },
 ];
 

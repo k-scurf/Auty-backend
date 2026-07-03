@@ -13,6 +13,7 @@ import numpy as np
 from vision.aligner import align_crop
 from vision.config import get_cfg
 from vision.embedder import embed_bgr
+from vision.enrollment_pose_guide import PoseGuide, PoseTarget, estimate_pose
 from vision.quality import assess_face, passes_enroll_capture
 
 DEFAULT_PHASES = [
@@ -40,6 +41,21 @@ def _phase_timeout() -> float:
     return float(get_cfg("enrollment_phase_timeout_sec", 12))
 
 
+def _stability_frames() -> int:
+    return int(get_cfg("enrollment_stability_frames", 9))
+
+
+def _pose_target_for_phase(name: str, instruction: str, yaw_min: float, yaw_max: float) -> PoseTarget:
+    """Translate a DEFAULT_PHASES band into a PoseGuide target for stability tracking."""
+    if name == "up":
+        return PoseTarget(name, instruction, yaw=0, pitch=-18, yaw_tolerance=33, pitch_tolerance=15)
+    if name == "down":
+        return PoseTarget(name, instruction, yaw=0, pitch=18, yaw_tolerance=33, pitch_tolerance=15)
+    yaw_center = (yaw_min + yaw_max) / 2.0
+    yaw_tol = max(8.0, (yaw_max - yaw_min) / 2.0)
+    return PoseTarget(name, instruction, yaw=yaw_center, pitch=0, yaw_tolerance=yaw_tol, pitch_tolerance=20)
+
+
 @dataclass
 class EnrollmentSession:
     active: bool = False
@@ -55,6 +71,9 @@ class EnrollmentSession:
     last_preview: Optional[np.ndarray] = None
     phase_started_at: float = 0.0
     last_sample_at: float = 0.0
+    pose_guide: PoseGuide = field(default_factory=lambda: PoseGuide([], stability_frames=9))
+    face_visible: bool = False
+    no_face_streak: int = 0
 
     def start(self, track_id: int):
         self.active = True
@@ -70,6 +89,19 @@ class EnrollmentSession:
         self.last_preview = None
         self.phase_started_at = time.time()
         self.last_sample_at = 0.0
+        self.pose_guide = PoseGuide([], stability_frames=_stability_frames())
+        self.face_visible = False
+        self.no_face_streak = 0
+
+    def mark_no_face(self) -> None:
+        """Call once per frame where detection found nobody — otherwise the
+        UI just freezes on stale state with no clue why nothing is happening."""
+        if not self.active:
+            return
+        self.face_visible = False
+        self.no_face_streak += 1
+        self.last_reject_reason = "no_face"
+        self.pose_guide.clear_buffer()
 
     def cancel(self):
         self.active = False
@@ -94,6 +126,14 @@ class EnrollmentSession:
         if self.phase_idx >= len(phases):
             return None
         return phases[self.phase_idx]
+
+    def _sync_pose_guide(self, name: str, instruction: str, yaw_min: float, yaw_max: float):
+        """Rebuild the stability-tracking PoseGuide when the active phase changes."""
+        current = self.pose_guide.current_target()
+        if current is not None and current.name == name:
+            return
+        target = _pose_target_for_phase(name, instruction, yaw_min, yaw_max)
+        self.pose_guide = PoseGuide([target], stability_frames=_stability_frames())
 
     def _maybe_advance_phase_timeout(self):
         phase = self._phase()
@@ -135,18 +175,24 @@ class EnrollmentSession:
         if not self.active or track.get("id") != self.track_id:
             return False, None
 
+        self.face_visible = True
+        self.no_face_streak = 0
+
         self._maybe_advance_phase_timeout()
         self.tick_count += 1
-
-        min_gap = float(get_cfg("enrollment_sample_interval_sec", 0.12))
-        if time.time() - self.last_sample_at < min_gap:
-            return False, None
 
         phase = self._phase()
         if phase is None:
             return False, None
 
         name, instruction, target, yaw_min, yaw_max = phase
+        self._sync_pose_guide(name, instruction, yaw_min, yaw_max)
+        self.pose_guide.update(kps=track.get("kps"))
+
+        min_gap = float(get_cfg("enrollment_sample_interval_sec", 0.12))
+        if time.time() - self.last_sample_at < min_gap:
+            return False, None
+
         bbox = track.get("smooth_bbox") or track.get("bbox")
         if not bbox:
             return False, None
@@ -187,12 +233,20 @@ class EnrollmentSession:
             self.phase_started_at = time.time()
             return False, None
 
+        angles = estimate_pose(kps=track.get("kps"))
+        pose_angles = (
+            {"yaw": angles.yaw, "pitch": angles.pitch, "roll": angles.roll}
+            if angles is not None
+            else None
+        )
+
         self.samples.append(
             {
                 "phase": name,
                 "embedding": emb,
                 "crop": aligned.copy(),
                 "pose": name,
+                "pose_angles": pose_angles,
             }
         )
         self.last_preview = aligned.copy()
@@ -259,6 +313,8 @@ class EnrollmentSession:
                 "active": True,
                 "phase": "done",
                 "instruction": "Ready — add a name (optional)",
+                "live_message": "Ready — add a name (optional)",
+                "face_visible": self.face_visible,
                 "captured": captured,
                 "target": total_target,
                 "min_auto": min_auto,
@@ -281,6 +337,8 @@ class EnrollmentSession:
             "active": True,
             "phase": name,
             "instruction": instruction,
+            "live_message": self._live_message(instruction),
+            "face_visible": self.face_visible,
             "captured": captured,
             "target": total_target,
             "min_auto": min_auto,
@@ -293,8 +351,29 @@ class EnrollmentSession:
             "phase_counts": phase_counts,
             "phase_targets": phase_targets,
             "phases": phases_order,
+            **self._pose_guide_info(),
             **base,
         }
+
+    def _pose_guide_info(self) -> dict:
+        return self.pose_guide.status()
+
+    def _live_message(self, default_instruction: str) -> str:
+        """Friendly, reason-specific guidance for whatever's currently
+        blocking capture — falls back to the phase instruction once
+        everything checks out, same as Face ID's prompts."""
+        if not self.face_visible:
+            return "We can't see your face — move into the center of the frame"
+        reason = self.last_reject_reason
+        if reason == "lighting":
+            return "Move to better lighting — not too dark or too bright"
+        if reason == "blur":
+            return "Hold still"
+        if reason == "size":
+            return "Move a little closer to the camera"
+        if reason == "embed":
+            return "Having trouble reading your face — try repositioning"
+        return default_instruction
 
     def _preview_b64(self) -> Optional[str]:
         if self.last_preview is None:
@@ -314,3 +393,6 @@ class EnrollmentSession:
 
     def poses(self) -> List[str]:
         return [s["pose"] for s in self.samples]
+
+    def pose_angles(self) -> List[Optional[dict]]:
+        return [s.get("pose_angles") for s in self.samples]

@@ -28,6 +28,7 @@ class IdentityRecord:
     master_embedding: Optional[list] = None
     image_paths: List[str] = field(default_factory=list)
     poses: List[str] = field(default_factory=list)
+    pose_angles: List[Optional[dict]] = field(default_factory=list)
     metadata: dict = field(default_factory=dict)
 
     def to_face_db_entry(self) -> List[list]:
@@ -127,9 +128,15 @@ class IdentityStore:
         *,
         image_path: Optional[str] = None,
         poses: Optional[List[str]] = None,
+        pose_angles: Optional[List[Optional[dict]]] = None,
         profile: Optional[dict] = None,
     ) -> IdentityRecord:
-        normed = [l2_normalize(e) for e in embeddings if is_embedding(e)]
+        kept_mask = [is_embedding(e) for e in embeddings]
+        normed = [l2_normalize(e) for e, keep in zip(embeddings, kept_mask) if keep]
+        if pose_angles is not None:
+            kept_angles = [a for a, keep in zip(pose_angles, kept_mask) if keep]
+        else:
+            kept_angles = [None] * len(normed)
         master = l2_normalize(np.mean(np.array(normed), axis=0)) if normed else None
         rec_id = str(uuid.uuid4())
         folder = IDENTITIES_DIR / rec_id
@@ -152,6 +159,7 @@ class IdentityStore:
             master_embedding=master,
             image_paths=image_paths,
             poses=poses or [],
+            pose_angles=kept_angles[: self.max_embeddings],
             metadata=meta,
         )
         self._calibrate_record(rec)
@@ -210,15 +218,19 @@ class IdentityStore:
             )
         return out
 
-    def add_embedding(self, name: str, embedding) -> bool:
+    def add_embedding(
+        self, name: str, embedding, *, pose_angles: Optional[dict] = None
+    ) -> bool:
         rec = self.find_by_name(name)
         if rec is None:
-            rec = self.add_person(name, [embedding])
+            rec = self.add_person(name, [embedding], pose_angles=[pose_angles])
             return True
         emb = l2_normalize(embedding)
         rec.embeddings.append(emb)
+        rec.pose_angles = (rec.pose_angles or []) + [pose_angles]
         if len(rec.embeddings) > self.max_embeddings:
             rec.embeddings = rec.embeddings[-self.max_embeddings :]
+            rec.pose_angles = rec.pose_angles[-self.max_embeddings :]
         rec.master_embedding = l2_normalize(
             np.mean(np.array(rec.embeddings), axis=0)
         )

@@ -7,6 +7,7 @@ import { AlertsPage } from "./pages/AlertsPage";
 import { SettingsPage } from "./pages/SettingsPage";
 import { DebugPage } from "./pages/DebugPage";
 import { KioskPage } from "./pages/KioskPage";
+import { SchedulePage } from "./pages/SchedulePage";
 
 export default function App() {
   return (
@@ -19,6 +20,7 @@ export default function App() {
           <Route index element={<DashboardPage />} />
           <Route path="logs" element={<LogsPage />} />
           <Route path="profiles" element={<ProfilesPage />} />
+          <Route path="schedules" element={<SchedulePage />} />
           <Route path="alerts" element={<AlertsPage />} />
           <Route path="settings" element={<SettingsPage />} />
           <Route path="debug" element={<DebugPage />} />

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Start Auty API server. Live camera is in the dashboard (browser), not a native window."""
 
+import socket
 import sys
 import threading
 from pathlib import Path
@@ -17,7 +18,20 @@ _CERT = _CERTS_DIR / "server.crt"
 _KEY = _CERTS_DIR / "server.key"
 
 _HTTP_PORT = 8000   # Mac browser — http://localhost:8000
-_HTTPS_PORT = 8443  # iPad over LAN — https://192.168.1.100:8443
+_HTTPS_PORT = 8443  # iPad over LAN — https://<lan-ip>:8443
+
+
+def _lan_ip() -> str:
+    """Best-effort LAN IP — doesn't actually send packets, just picks the
+    interface that would route to the internet."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
 
 
 def _start_https():
@@ -41,7 +55,7 @@ def main():
         t = threading.Thread(target=_start_https, daemon=True, name="auty-https")
         t.start()
         print(f"[Auty] HTTP  → http://localhost:{_HTTP_PORT}  (Mac browser)")
-        print(f"[Auty] HTTPS → https://192.168.1.100:{_HTTPS_PORT}  (iPad — install certs/rootCA.pem first)")
+        print(f"[Auty] HTTPS → https://{_lan_ip()}:{_HTTPS_PORT}  (iPad — install certs/rootCA.pem first)")
     else:
         print(f"[Auty] HTTP  → http://localhost:{_HTTP_PORT}")
 
